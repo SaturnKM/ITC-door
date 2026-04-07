@@ -1,0 +1,19 @@
+{
+  "name": "rfid-access-server",
+  "version": "1.0.0",
+  "description": "RFID Access Control Server - ESP32 <-> Discord bridge",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "discord.js": "^14.14.1",
+    "express": "^4.18.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
