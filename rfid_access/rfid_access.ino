@@ -66,12 +66,11 @@ Roles      : Exclusive board | President | Leader | banned | pending
 const char* WIFI_SSID   = "DOOR_ACCESS";
 const char* WIFI_PASS   = "DOOR_ACCESS";
 
-// Your Railway deployment URL (no trailing slash)
-// Example: "https://rfid-access-server-production.up.railway.app"
+// Your deployment URL
 const char* SERVER_URL  = "https://YOUR_RAILWAY_URL.up.railway.app";
 
 // Must match API_KEY in your Railway environment variables
-const char* API_KEY     = "changeme123";
+const char* API_KEY     = "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+";
 
 const int ACCESS_HOUR_START = 10;
 const int ACCESS_HOUR_END   = 16;

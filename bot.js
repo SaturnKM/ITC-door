@@ -352,20 +352,8 @@ client.on("interactionCreate", async (interaction) => {
 
   // ── BUTTON INTERACTIONS ───────────────────────────────────
   if (interaction.isButton()) {
-    const [action, ...parts] = interaction.customId.split("_");
-    // Reconstruct uid (might contain underscores via padding)
-    // We used formatUID which is pure digits so no underscore issue
-    const uid = parts.join("_");
-
-    await interaction.deferReply({ ephemeral: true });
-
-    if (action === "grant") {
-      // custom_id: grant_day_<uid>  → split is ["grant","day","<uid>"]
-      // But we split on first "_" only above, so let's re-parse:
-      return handleButton(interaction);
-    }
-
-    return handleButton(interaction);
+  await interaction.deferReply({ ephemeral: true });
+  return handleButton(interaction);
   }
 
   // ── SLASH COMMANDS ────────────────────────────────────────
