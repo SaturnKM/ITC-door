@@ -34,8 +34,7 @@ const {
 
 // ── Config ───────────────────────────────────────────────────
 const BOT_TOKEN  = process.env.BOT_TOKEN;
-const GUILD_ID   = "800009861982191617";
-const CHANNEL_ID = process.env.CHANNEL_ID; // Set this after you create the channel
+const CHANNEL_ID = process.env.CHANNEL_ID; // Optional: set a default channel
 
 if (!BOT_TOKEN) {
   console.error("[Bot] ERROR: BOT_TOKEN not set in .env");
@@ -160,11 +159,11 @@ const commands = [
 const registerCommands = async () => {
   const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
   try {
-    console.log("[Bot] Registering slash commands...");
-    await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), {
+    console.log("[Bot] Registering global slash commands...");
+    await rest.put(Routes.applicationCommands(client.user.id), {
       body: commands.map((c) => c.toJSON()),
     });
-    console.log("[Bot] Slash commands registered OK");
+    console.log("[Bot] Global slash commands registered OK (may take up to 1 hour to appear in new servers)");
   } catch (err) {
     console.error("[Bot] Command registration failed:", err.message);
   }
@@ -368,11 +367,13 @@ client.on("interactionCreate", async (interaction) => {
       // ── /setchannel ──────────────────────────────────────
       case "setchannel": {
         notifyChannel = interaction.channel;
-        // Also persist to env hint in console
-        console.log(`[Bot] Notify channel set: ${interaction.channelId}`);
+        // Persist channel ID to DB so it survives restarts
+        const { saveChannelId } = require("./database");
+        saveChannelId(interaction.channelId);
+        console.log(`[Bot] Notify channel set and saved: ${interaction.channelId}`);
         return interaction.editReply(
           `✅ Notifications will now be sent to <#${interaction.channelId}>.\n` +
-          `Set \`CHANNEL_ID=${interaction.channelId}\` in your Railway environment variables to persist this across restarts.`
+          `This channel has been saved and will persist across restarts.`
         );
       }
 
@@ -674,16 +675,20 @@ client.once("ready", async () => {
   console.log(`[Bot] Logged in as ${client.user.tag}`);
   await registerCommands();
 
-  // Cache the notify channel if CHANNEL_ID is set
-  if (CHANNEL_ID) {
+  // Load saved channel ID from DB first, then fall back to env CHANNEL_ID
+  const { getChannelId } = require("./database");
+  const savedChannelId = getChannelId() || CHANNEL_ID;
+
+  if (savedChannelId) {
     try {
-      notifyChannel = await client.channels.fetch(CHANNEL_ID);
+      notifyChannel = await client.channels.fetch(savedChannelId);
       console.log(`[Bot] Notify channel loaded: #${notifyChannel.name}`);
     } catch (e) {
-      console.warn("[Bot] Could not load CHANNEL_ID:", e.message);
+      console.warn("[Bot] Could not load saved channel:", e.message);
+      console.warn("[Bot] Use /setchannel in any channel to configure notifications.");
     }
   } else {
-    console.warn("[Bot] CHANNEL_ID not set. Use /setchannel in Discord to configure.");
+    console.warn("[Bot] No channel configured. Use /setchannel in Discord to set one.");
   }
 });
 

@@ -37,6 +37,11 @@ db.exec(`
     PRIMARY KEY (uid, granted_day)
   );
 
+  CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS pending_commands (
     id        TEXT    PRIMARY KEY,
     action    TEXT    NOT NULL,
@@ -223,6 +228,26 @@ setInterval(() => {
     console.log(`[DB] Cleaned up ${deleted.changes} old commands`);
 }, 3600_000); // every hour
 
+// ════════════════════════════════════════════════════════════
+// SETTINGS (persistent key-value store)
+// ════════════════════════════════════════════════════════════
+
+/** Save a setting value by key. */
+const saveSetting = (key, value) =>
+  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
+
+/** Get a setting value by key. Returns string or null. */
+const getSetting = (key) => {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key);
+  return row ? row.value : null;
+};
+
+/** Persist the Discord notification channel ID. */
+const saveChannelId = (channelId) => saveSetting("notify_channel_id", channelId);
+
+/** Retrieve the saved Discord notification channel ID. */
+const getChannelId = () => getSetting("notify_channel_id");
+
 module.exports = {
   db,
   getMember,
@@ -239,4 +264,8 @@ module.exports = {
   pushCommand,
   getPendingCommands,
   ackCommand,
+  saveSetting,
+  getSetting,
+  saveChannelId,
+  getChannelId,
 };
