@@ -2,7 +2,7 @@
 // BOT.JS — Discord.js v14 Bot
 // Fixed: button handler, missing actions, command responses
 // ============================================================
-require("dotenv").config();
+require("dotenv").config(); 
 const {
   Client,
   GatewayIntentBits,
