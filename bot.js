@@ -421,26 +421,15 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       // ── /add ─────────────────────────────────────────────
-      case "add": {
+     case "add": {
         const uid  = formatUID(interaction.options.getString("uid").trim());
         const name = interaction.options.getString("name").trim();
-        const role = interaction.options.getString("role");
-
-        const existing = getMember(uid);
-        if (existing && existing.role !== "pending") {
-          return interaction.editReply(
-            `⚠️ UID \`${uid}\` already exists as **${existing.name}** (${existing.role}).`
-          );
-        }
+        const role = interaction.options.getString("role"); // Use the role SELECTED in the command
 
         upsertMember(uid, name, role, interaction.user.tag);
+        pushCommand(`add_${Date.now()}`, "add", uid, name, role); 
 
-        const cmdId = `add_${Date.now()}`;
-        pushCommand(cmdId, "add", uid, name, role);
-
-        return interaction.editReply(
-          `✅ **${name}** added with role **${role}** (UID: \`${uid}\`)`
-        );
+        return interaction.editReply(`✅ **${name}** added as **${role}**.`);
       }
 
       // ── /ban ─────────────────────────────────────────────
@@ -465,18 +454,14 @@ client.on("interactionCreate", async (interaction) => {
       case "unban": {
         const uid = formatUID(interaction.options.getString("uid").trim());
         const member = getMember(uid);
+        if (!member) return interaction.editReply(`❌ UID \`${uid}\` not found.`);
 
-        if (!member) {
-          return interaction.editReply(`❌ UID \`${uid}\` not found in database.`);
-        }
+        // Instead of forcing "Leader", we set it to 'pending' 
+        // so you can use /setrole to give them the right rank.
+        updateRole(uid, "pending"); 
+        pushCommand(`unban_${Date.now()}`, "unban", uid, member.name);
 
-        updateRole(uid, "Leader");
-        const cmdId = `unban_${Date.now()}`;
-        pushCommand(cmdId, "unban", uid, member.name);
-
-        return interaction.editReply(
-          `✅ **${member.name}** (UID: \`${uid}\`) has been **unbanned** and restored to Leader.`
-        );
+        return interaction.editReply(`✅ **${member.name}** unbanned. Use \`/setrole\` to assign a rank.`);
       }
 
       // ── /grant_day ───────────────────────────────────────
@@ -591,45 +576,21 @@ client.on("interactionCreate", async (interaction) => {
         const count = interaction.options.getInteger("count") || 10;
         const entries = getRecentLog(Math.min(count, 50));
 
-        if (entries.length === 0) {
-          return interaction.editReply("_No scan log entries yet._");
-        }
+        if (entries.length === 0) return interaction.editReply("_No scans yet._");
 
         const lines = entries.map((e) => {
-          const ts = new Date(e.scanned_at * 1000).toLocaleTimeString("fr-DZ", {
-            hour: "2-digit", minute: "2-digit", second: "2-digit",
-            timeZone: "Africa/Algiers",
-          });
-          const dateStr = new Date(e.scanned_at * 1000).toLocaleDateString("fr-DZ", {
-            day: "2-digit", month: "2-digit",
-            timeZone: "Africa/Algiers",
-          });
-          return `\`${dateStr} ${ts}\` \`${e.uid}\` **${e.name}** — ${resultLabel(e.result)}`;
+          // resultLabel is a helper function in your bot.js that 
+          // converts codes like "GRANTED_REMOTE" into "🔓 Door Opened"
+          const status = resultLabel(e.result); 
+          return `\`${e.uid}\` **${e.name}**: ${status}`;
         });
 
-        // Split into chunks if too long for one embed
-        const chunkSize = 15;
-        const chunks = [];
-        for (let i = 0; i < lines.length; i += chunkSize) {
-          chunks.push(lines.slice(i, i + chunkSize).join("\n"));
-        }
-
         const embed = new EmbedBuilder()
-          .setTitle(`📜 Last ${entries.length} Scan Events`)
+          .setTitle("📜 Door Access History")
           .setColor(0x2196f3)
-          .setDescription(chunks[0])
-          .setTimestamp();
+          .setDescription(lines.join("\n"));
 
-        await interaction.editReply({ embeds: [embed] });
-
-        // Send remaining chunks as follow-up if needed
-        for (let i = 1; i < chunks.length; i++) {
-          const followEmbed = new EmbedBuilder()
-            .setColor(0x2196f3)
-            .setDescription(chunks[i]);
-          await interaction.followUp({ embeds: [followEmbed] });
-        }
-        return;
+        return interaction.editReply({ embeds: [embed] });
       }
 
       // ── /report ──────────────────────────────────────────
@@ -681,111 +642,51 @@ client.on("interactionCreate", async (interaction) => {
 // ════════════════════════════════════════════════════════════
 async function handleButton(interaction) {
   const id = interaction.customId;
+  const uid = id.split('_').pop(); // Cleaner way to get the UID from the button
+  const existing = getMember(uid);
 
-  // ── Grant Once ───────────────────────────────────────────
-  // Opens door immediately this one time. No memory saved.
-  // Card remains "pending" in DB for future scans.
+  // If the card isn't in the database yet, keep it 'pending'
+  if (!existing) {
+    upsertMember(uid, "Unknown", "pending", interaction.user.tag);
+  }
+
   if (id.startsWith("grant_once_")) {
-    const uid = id.replace("grant_once_", "");
+    logScan(uid, existing?.name || "Unknown", "GRANTED_ONCE"); // Logged as "Opened"
+    pushCommand(`once_${Date.now()}`, "grant_once", uid);
 
-    // Save as pending so /pending shows it (not approved, not forgotten)
-    const existing = getMember(uid);
-    if (!existing) {
-      upsertMember(uid, "Unknown", "pending", interaction.user.tag);
-    }
+    await interaction.editReply(`✅ Door opened once for UID: \`${uid}\`.`);
+    await interaction.message.edit({
+      components: [disabledButtons(uid, "✅ Once Granted", ButtonStyle.Success)],
+    });
 
-    // Log it
-    logScan(uid, existing?.name || "Unknown", "GRANTED_ONCE");
-
-    // Push command to ESP — grant_once opens door, no RAM save
-    const cmdId = `grantonce_${Date.now()}`;
-    pushCommand(cmdId, "grant_once", uid);
-
-    await interaction.editReply(
-      `✅ **${interaction.user.tag}** granted **one-time** access for UID \`${uid}\`. Door opening now.`
-    );
-
-    try {
-      await interaction.message.edit({
-        components: [disabledButtons(uid, "✅ Once Granted", ButtonStyle.Success)],
-      });
-    } catch {}
-
-  // ── Grant 1 Day ──────────────────────────────────────────
-  // Saves to ESP RAM until midnight. Card stays pending in DB.
   } else if (id.startsWith("grant_day_")) {
-    const uid = id.replace("grant_day_", "");
-
-    const existing = getMember(uid);
-    if (!existing) {
-      upsertMember(uid, "Unknown", "pending", interaction.user.tag);
-    }
-
     grantDay(uid);
-    logScan(uid, existing?.name || "Unknown", "GRANTED_LEADER_DAY");
+    logScan(uid, existing?.name || "Unknown", "GRANTED_LEADER_DAY"); // Logged as "Day Access"
+    pushCommand(`day_${Date.now()}`, "grant_day", uid);
 
-    const cmdId = `grantday_${Date.now()}`;
-    pushCommand(cmdId, "grant_day", uid);
+    await interaction.editReply(`🌞 Day access granted for UID: \`${uid}\`.`);
+    await interaction.message.edit({
+      components: [disabledButtons(uid, "✅ Day Granted", ButtonStyle.Primary)],
+    });
 
-    await interaction.editReply(
-      `🌞 **${interaction.user.tag}** granted full-day access for UID \`${uid}\`. Resets at midnight.`
-    );
-
-    try {
-      await interaction.message.edit({
-        components: [disabledButtons(uid, "✅ Day Granted", ButtonStyle.Primary)],
-      });
-    } catch {}
-
-  // ── Block for Today ──────────────────────────────────────
-  // Blocks in ESP RAM until midnight. Not saved to DB permanently.
   } else if (id.startsWith("block_day_")) {
-    const uid = id.replace("block_day_", "");
+    logScan(uid, existing?.name || "Unknown", "DENIED_BLOCKED_DAY"); // Logged as "Denied"
+    pushCommand(`block_${Date.now()}`, "block_day", uid);
 
-    // Still save as pending so admins can review later
-    const existing = getMember(uid);
-    if (!existing) {
-      upsertMember(uid, "Unknown", "pending", interaction.user.tag);
-    }
+    await interaction.editReply(`🚫 Blocked UID \`${uid}\` for today.`);
+    await interaction.message.edit({
+      components: [disabledButtons(uid, "🚫 Blocked Today", ButtonStyle.Secondary)],
+    });
 
-    logScan(uid, existing?.name || "Unknown", "DENIED_BLOCKED_DAY");
-
-    const cmdId = `blockday_${Date.now()}`;
-    pushCommand(cmdId, "block_day", uid);
-
-    await interaction.editReply(
-      `🚫 **${interaction.user.tag}** blocked UID \`${uid}\` for today. Discord will be asked again tomorrow.`
-    );
-
-    try {
-      await interaction.message.edit({
-        components: [disabledButtons(uid, "🚫 Blocked Today", ButtonStyle.Secondary)],
-      });
-    } catch {}
-
-  // ── Permanent Ban ────────────────────────────────────────
   } else if (id.startsWith("ban_")) {
-    const uid = id.replace("ban_", "");
-
-    upsertMember(uid, "Unknown", "banned", interaction.user.tag);
     updateRole(uid, "banned");
-    logScan(uid, "Unknown", "BANNED");
+    logScan(uid, "Unknown", "BANNED"); // Logged as "Banned"
+    pushCommand(`ban_${Date.now()}`, "ban", uid);
 
-    const cmdId = `ban_${Date.now()}`;
-    pushCommand(cmdId, "ban", uid);
-
-    await interaction.editReply(
-      `🚫 **${interaction.user.tag}** permanently banned UID \`${uid}\`.`
-    );
-
-    try {
-      await interaction.message.edit({
-        components: [disabledButtons(uid, "🚫 Banned", ButtonStyle.Danger)],
-      });
-    } catch {}
-
-  } else {
-    await interaction.editReply("Unknown button action.");
+    await interaction.editReply(`🚫 UID \`${uid}\` has been permanently banned.`);
+    await interaction.message.edit({
+      components: [disabledButtons(uid, "🚫 Banned", ButtonStyle.Danger)],
+    });
   }
 }
 
