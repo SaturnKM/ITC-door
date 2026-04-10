@@ -229,9 +229,8 @@ const formatUID = (uid) => String(uid).padStart(10, "0");
 // "Block Today" blocks UID in ESP RAM until midnight.
 // "Ban Card"    permanently bans UID in DB + ESP CSV.
 // ════════════════════════════════════════════════════════════
-// 🟢 Grant Once | 🟡 Grant 1 Day | ⚫ Denied | 👤 Add Member
-const unknownButtons = (uid) =>
-  new ActionRowBuilder().addComponents(
+unknownButtons = (uid, isGranted) => {
+  const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`grant_once_${uid}`)
       .setLabel("Grant Once")
@@ -246,13 +245,28 @@ const unknownButtons = (uid) =>
       .setCustomId(`block_day_${uid}`)
       .setLabel("Denied")
       .setEmoji("⚫")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(`add_member_${uid}`)
-      .setLabel("Add Member")
-      .setEmoji("👤")
-      .setStyle(ButtonStyle.Primary)
+      .setStyle(ButtonStyle.Secondary)
   );
+
+  if (isGranted) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`revoke_day_${uid}`)
+        .setLabel("Revoke Day")
+        .setEmoji("🗑️")
+        .setStyle(ButtonStyle.Danger)
+    );
+  } else {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`add_member_${uid}`)
+        .setLabel("Add Member")
+        .setEmoji("👤")
+        .setStyle(ButtonStyle.Primary)
+    );
+  }
+  return row;
+};
 
 const disabledButtons = (uid, activeLabel, activeStyle) =>
   new ActionRowBuilder().addComponents(
@@ -660,8 +674,16 @@ async function handleButton(interaction) {
     pushCommand(`add_${Date.now()}`, "add_member", uid); // Tells ESP32 to save locally
     await interaction.editReply(`👤 UID \`${uid}\` added as a **Member**.`);
     await interaction.message.edit({ components: [disabledButtons(uid, "👤 Member Added", ButtonStyle.Primary)] });
-  }
-}
+  } else if (id.startsWith("revoke_day_")) {
+    // This command tells the ESP32 to delete the temporary UID from its RAM
+    pushCommand(`revoke_${Date.now()}`, "revoke_day", uid);
+    
+    await interaction.editReply(`🗑️ **Day access revoked** for UID: \`${uid}\`. They must scan again for approval.`);
+    await interaction.message.edit({ 
+      components: [disabledButtons(uid, "🗑️ Access Revoked", ButtonStyle.Danger)] 
+    });
+  
+}}
 // ════════════════════════════════════════════════════════════
 // BOT READY
 // ════════════════════════════════════════════════════════════
@@ -691,4 +713,7 @@ const startBot = async () => {
   await client.login(BOT_TOKEN);
 };
 
-module.exports = { startBot, notifyDiscord };
+module.exports = { 
+  startBot: () => client.login(BOT_TOKEN), 
+  notifyDiscord 
+};
