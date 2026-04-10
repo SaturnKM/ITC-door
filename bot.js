@@ -6,7 +6,7 @@ require("dotenv").config();
 const {
   Client,
   GatewayIntentBits,
-  REST,
+  REST, 
   Routes,
   SlashCommandBuilder,
   EmbedBuilder,
