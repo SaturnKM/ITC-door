@@ -226,27 +226,32 @@ const formatUID = (uid) => String(uid).padStart(10, "0");
 // "Block Today" blocks UID in ESP RAM until midnight.
 // "Ban Card"    permanently bans UID in DB + ESP CSV.
 // ════════════════════════════════════════════════════════════
+// 🟢 Grant Once | 🟡 Grant 1 Day | ⚫ Denied | 🔴 Ban Card
 const unknownButtons = (uid) =>
   new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`grant_once_${uid}`)
       .setLabel("Grant Once")
+      .setEmoji("🟢")
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`grant_day_${uid}`)
       .setLabel("Grant 1 Day")
+      .setEmoji("🟡")
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`block_day_${uid}`)
-      .setLabel("Block Today")
+      .setLabel("Deny Today")
+      .setEmoji("⚫")
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`ban_${uid}`)
       .setLabel("Ban Card")
+      .setEmoji("🔴")
       .setStyle(ButtonStyle.Danger)
   );
 
-// Disabled version after a button is clicked — shows which action was taken
+// Shows the result after you click one
 const disabledButtons = (uid, activeLabel, activeStyle) =>
   new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -261,7 +266,7 @@ const disabledButtons = (uid, activeLabel, activeStyle) =>
       .setDisabled(true),
     new ButtonBuilder()
       .setCustomId(`block_day_${uid}`)
-      .setLabel(activeStyle === ButtonStyle.Secondary ? activeLabel : "Block Today")
+      .setLabel(activeStyle === ButtonStyle.Secondary ? activeLabel : "Denied")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(true),
     new ButtonBuilder()
@@ -642,50 +647,51 @@ client.on("interactionCreate", async (interaction) => {
 // ════════════════════════════════════════════════════════════
 async function handleButton(interaction) {
   const id = interaction.customId;
-  const uid = id.split('_').pop(); // Cleaner way to get the UID from the button
+  const uid = id.split('_').pop();
   const existing = getMember(uid);
 
-  // If the card isn't in the database yet, keep it 'pending'
+  // If unknown, initialize as pending
   if (!existing) {
     upsertMember(uid, "Unknown", "pending", interaction.user.tag);
   }
 
   if (id.startsWith("grant_once_")) {
-    logScan(uid, existing?.name || "Unknown", "GRANTED_ONCE"); // Logged as "Opened"
+    logScan(uid, "Unknown", "GRANTED_ONCE");
     pushCommand(`once_${Date.now()}`, "grant_once", uid);
 
-    await interaction.editReply(`✅ Door opened once for UID: \`${uid}\`.`);
+    await interaction.editReply(`🟢 **One-time access** granted for UID: \`${uid}\`.`);
     await interaction.message.edit({
-      components: [disabledButtons(uid, "✅ Once Granted", ButtonStyle.Success)],
+      components: [disabledButtons(uid, "🟢 Once Granted", ButtonStyle.Success)],
     });
 
   } else if (id.startsWith("grant_day_")) {
     grantDay(uid);
-    logScan(uid, existing?.name || "Unknown", "GRANTED_LEADER_DAY"); // Logged as "Day Access"
+    logScan(uid, "Unknown", "GRANTED_LEADER_DAY");
     pushCommand(`day_${Date.now()}`, "grant_day", uid);
 
-    await interaction.editReply(`🌞 Day access granted for UID: \`${uid}\`.`);
+    await interaction.editReply(`🟡 **Full-day access** granted for UID: \`${uid}\`.`);
     await interaction.message.edit({
-      components: [disabledButtons(uid, "✅ Day Granted", ButtonStyle.Primary)],
+      components: [disabledButtons(uid, "🟡 Day Granted", ButtonStyle.Primary)],
     });
 
   } else if (id.startsWith("block_day_")) {
-    logScan(uid, existing?.name || "Unknown", "DENIED_BLOCKED_DAY"); // Logged as "Denied"
+    // "Deny" just logs it and tells the ESP32 to ignore it for now
+    logScan(uid, "Unknown", "DENIED_BLOCKED_DAY");
     pushCommand(`block_${Date.now()}`, "block_day", uid);
 
-    await interaction.editReply(`🚫 Blocked UID \`${uid}\` for today.`);
+    await interaction.editReply(`⚫ Access **Denied** for UID: \`${uid}\` (Blocked for today).`);
     await interaction.message.edit({
-      components: [disabledButtons(uid, "🚫 Blocked Today", ButtonStyle.Secondary)],
+      components: [disabledButtons(uid, "⚫ Denied", ButtonStyle.Secondary)],
     });
 
   } else if (id.startsWith("ban_")) {
     updateRole(uid, "banned");
-    logScan(uid, "Unknown", "BANNED"); // Logged as "Banned"
+    logScan(uid, "Unknown", "BANNED");
     pushCommand(`ban_${Date.now()}`, "ban", uid);
 
-    await interaction.editReply(`🚫 UID \`${uid}\` has been permanently banned.`);
+    await interaction.editReply(`🔴 UID \`${uid}\` has been **permanently banned**.`);
     await interaction.message.edit({
-      components: [disabledButtons(uid, "🚫 Banned", ButtonStyle.Danger)],
+      components: [disabledButtons(uid, "🔴 Banned", ButtonStyle.Danger)],
     });
   }
 }
