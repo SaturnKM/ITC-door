@@ -67,7 +67,7 @@ const char* WIFI_SSID   = "DOOR_ACCESS";
 const char* WIFI_PASS   = "DOOR_ACCESS";
 
 // Your deployment URL
-const char* SERVER_URL  = "https://YOUR_RAILWAY_URL.up.railway.app";
+const char* SERVER_URL  = "https://rfid.robtic.org/";
 
 // Must match API_KEY in your Railway environment variables
 const char* API_KEY     = "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+";
