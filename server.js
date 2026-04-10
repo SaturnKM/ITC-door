@@ -62,20 +62,20 @@ app.post("/discord/check", checkKey, async (req, res) => {
 
 // ════════════════════════════════════════════════════════════
 // POST /discord/check/scan
-// Called when an UNKNOWN card is scanned.
-// Posts a Discord message with Grant / Ban buttons.
-// Body: { uid: "0012345678" }
+// Called on every card scan.
+// - Known members: return their DB info (role + day_grant)
+// - Unknown cards: ask Discord EVERY TIME — never save as pending
+// Body: { uid: "0012345678", name?: "..." }
 // ════════════════════════════════════════════════════════════
 app.post("/discord/check/scan", checkKey, async (req, res) => {
-  const { uid } = req.body;
+  const { uid, name } = req.body;
 
   if (!uid) return res.status(400).json({ error: "uid required" });
 
-  // Check if we know this person already
   const member = getMember(uid);
 
-  if (member) {
-    // Already in DB — return their info so ESP32 can decide locally
+  if (member && member.role !== "pending") {
+    // Known member — return their info, ESP32 decides locally
     return res.json({
       known: true,
       uid: member.uid,
@@ -85,24 +85,22 @@ app.post("/discord/check/scan", checkKey, async (req, res) => {
     });
   }
 
-  // Truly unknown — add as pending and ask Discord
-  upsertMember(uid, "Unknown", "pending", "esp32-scan");
+  // Unknown (or pending) — ask Discord EVERY TIME, never persist as pending
   logScan(uid, "Unknown", "NOT_IN_LIST");
 
   notifyDiscord({
     uid,
     name: "Unknown",
     result: "NOT_IN_LIST",
-    askButtons: true, // triggers Grant/Ban/Add buttons in Discord
+    askButtons: true,
   }).catch((e) => console.error("[Discord notify error]", e.message));
 
-  res.json({ known: false, uid, role: "pending" });
+  res.json({ known: false, uid, role: "unknown" });
 });
 
 // ════════════════════════════════════════════════════════════
 // GET /discord/check/commands
 // ESP32 polls this every 5 seconds.
-// Returns pending commands that haven't been acked yet.
 // ════════════════════════════════════════════════════════════
 app.get("/discord/check/commands", checkKey, (req, res) => {
   const commands = getPendingCommands();
@@ -124,7 +122,6 @@ app.post("/discord/check/ack", checkKey, (req, res) => {
 
 // ════════════════════════════════════════════════════════════
 // POST /discord/check/status-reply
-// ESP32 sends its status info, we forward to Discord
 // ════════════════════════════════════════════════════════════
 app.post("/discord/check/status-reply", checkKey, async (req, res) => {
   const data = req.body;

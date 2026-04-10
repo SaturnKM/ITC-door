@@ -2,43 +2,14 @@
 ============================================================
 RFID ACCESS CONTROL - @exlusif_board EDITION
 Platform : ESP32-C3 Mini
-Phase    : 2 — WiFi on-demand + Railway API + Discord live
 ============================================================
-PIN WIRING (ESP32-C3 Mini)
-┌─────────────────────────────────────────────────────────┐
-  [RDM6300 RFID] VCC->5V  GND->GND  TX->GPIO20(RX)
-  [LCD 16x2 I2C] VCC->5V  GND->GND
-                 SDA->GPIO6   SCL->GPIO7
-  [RELAY]        Signal->GPIO4
-  [BUZZER+LED]   Both wired in parallel -> GPIO3
-                 !! PASSIVE BUZZER for tones !!
-                 Set ACTIVE_BUZZER true if yours is active
-└─────────────────────────────────────────────────────────┘
-
-ARCHITECTURE:
-  ESP32  ──HTTP──►  Railway Server  ──►  Discord Bot
-  - Unknown cards: server tells Discord, buttons appear
-  - DB is on the server (SQLite), ESP32 keeps local CSV
-    as a fast offline cache for board/president access
-  - Commands from Discord arrive via poll every 5 seconds
-
-WIFI BEHAVIOUR:
-  Exclusive Board / President : fully local, NO WiFi needed
-  Leader / Banned / Unknown   : WiFi connects on scan
-  If WiFi fails               : still works locally, events
-                                 are queued and flushed later
-
-TIME RULES:
-  Leader      → 10:00–16:00 only (unless granted full day)
-  Board       → 24/7 (no WiFi needed)
-  President   → 24/7 (no WiFi needed) + fun message
-
-FIX: Leader cards now ask the server before opening the door.
-     Server checks day grants, role overrides, bans in DB.
-     Falls back to local logic if WiFi is unavailable.
-
-CSV format : Full Name,UID,Role
-Roles      : Exclusive board | President | Leader | banned | pending
+CHANGES vs previous version:
+  - Unknown cards: NEVER saved to DB/CSV — Discord asked
+    every single time, no memory between scans
+  - Grant 1 Day: saves to ESP RAM, door opens next scan
+  - Block Today: saves UID to RAM block list until midnight
+  - Permanent ban still works via ban button / /ban command
+  - All bot replies are now PUBLIC (visible to everyone)
 ============================================================ */
 
 #include <Wire.h>
@@ -48,7 +19,7 @@ Roles      : Exclusive board | President | Leader | banned | pending
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
-#include <ArduinoJson.h>  // Install via Library Manager: "ArduinoJson" by Benoit Blanchon
+#include <ArduinoJson.h>
 
 // ════════════════════════════════════════════════════════════
 // PIN DEFINITIONS
@@ -61,38 +32,33 @@ Roles      : Exclusive board | President | Leader | banned | pending
 #define RFID_TX_PIN  21
 
 // ════════════════════════════════════════════════════════════
-// CONFIGURATION — CHANGE THESE
+// CONFIGURATION
 // ════════════════════════════════════════════════════════════
-#define ACTIVE_BUZZER   false  // true = active buzzer (no tones)
-#define SKIP_TIME_CHECK false  // true = bypass hour check (testing)
-#define FORCE_REWRITE   false  // true = overwrite access.csv on boot
+#define ACTIVE_BUZZER   false
+#define SKIP_TIME_CHECK false
+#define FORCE_REWRITE   false
 
-const char* WIFI_SSID   = "DOOR_ACCESS";
-const char* WIFI_PASS   = "DOOR_ACCESS";
-
-// Your deployment URL
-const char* SERVER_URL  = "https://rfid.robtic.org";
-
-// Must match API_KEY in your Railway environment variables
-const char* API_KEY     = "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+";
+const char* WIFI_SSID  = "DOOR_ACCESS";
+const char* WIFI_PASS  = "DOOR_ACCESS";
+const char* SERVER_URL = "https://rfid.robtic.org";   // NO trailing slash
+const char* API_KEY    = "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+";
 
 const int ACCESS_HOUR_START = 10;
 const int ACCESS_HOUR_END   = 16;
 
-// NTP — Algeria is UTC+1
 const long  NTP_GMT_OFFSET_SEC  = 3600;
 const int   NTP_DAYLIGHT_OFFSET = 0;
 
-const unsigned long SCAN_COOLDOWN_MS  = 8000;
-const unsigned long DOOR_OPEN_MS      = 3000;
-const unsigned long LED_HOLD_MS       = 1500;
-const unsigned long POLL_INTERVAL_MS  = 5000;
-const unsigned long NTP_RETRY_MS      = 30000;
+const unsigned long SCAN_COOLDOWN_MS = 8000;
+const unsigned long DOOR_OPEN_MS     = 3000;
+const unsigned long LED_HOLD_MS      = 1500;
+const unsigned long POLL_INTERVAL_MS = 5000;
+const unsigned long NTP_RETRY_MS     = 30000;
 
 #define QUEUE_MAX 30
 
 // ════════════════════════════════════════════════════════════
-// EMBEDDED ACCESS LIST (local offline cache for board/president)
+// EMBEDDED ACCESS LIST (offline cache for board/president)
 // ════════════════════════════════════════════════════════════
 const char* DEFAULT_CSV =
   "Full Name,UID,Role\n"
@@ -169,11 +135,18 @@ struct QueueEntry {
 QueueEntry eventQueue[QUEUE_MAX];
 int queueCount = 0;
 
-// ── Temporary full-day grants (from bot command) ─────────────
+// ── Day grant list (RAM only, resets at midnight) ─────────────
 #define GRANT_LIST_MAX 20
 char grantedUIDs[GRANT_LIST_MAX][11];
 int  grantedCount = 0;
 int  grantedDay   = -1;
+
+// ── Day block list (RAM only, resets at midnight) ─────────────
+// UIDs where Discord chose "Block Today" — cleared at midnight
+#define BLOCK_LIST_MAX 20
+char blockedUIDs[BLOCK_LIST_MAX][11];
+int  blockedCount = 0;
+int  blockedDay   = -1;
 
 // ════════════════════════════════════════════════════════════
 // FORWARD DECLARATIONS
@@ -200,11 +173,15 @@ bool     updateRoleInCSV(const String& targetUID, const String& newRole);
 bool     addToCSV(const String& uid, const String& name, const String& role);
 bool     isGrantedToday(const char* uid);
 void     grantDayAccess(const char* uid);
+bool     isBlockedToday(const char* uid);
+void     blockDayAccess(const char* uid);
+void     checkMidnightReset();
 void     accessGrantedLeader(String name, bool dayGrant);
 void     accessGrantedBoard(String name);
 void     accessGrantedPresident(String name);
 void     accessBanned(String name);
 void     accessDeniedHours(String name);
+void     accessDeniedBlocked(String name);
 void     accessUnknown(unsigned long uid);
 void     accessDenied(String name, const char* reason);
 void     queueEvent(const char* uid, const char* name, const char* result);
@@ -234,7 +211,6 @@ void setup() {
   lcdPrint(" @exlusif_board", "  Booting...");
   delay(800);
 
-  // ── LittleFS ─────────────────────────────────────────────
   if (!LittleFS.begin(true)) {
     Serial.println(F("STARTUP_ERROR: LittleFS failed"));
     lcdPrint(" Flash Error!", " Re-flash ESP32");
@@ -322,9 +298,7 @@ void loop() {
 // URL BUILDER
 // ════════════════════════════════════════════════════════════
 String buildURL(const char* path) {
-  String url = String(SERVER_URL);
-  url += path;
-  return url;
+  return String(SERVER_URL) + String(path);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -381,7 +355,8 @@ bool syncNTP() {
   if (getLocalTime(&t, 100)) {
     timeReady  = true;
     grantedDay = t.tm_yday;
-    Serial.println(F(" OK"));
+    blockedDay = t.tm_yday;
+    Serial.println(F("... OK"));
     char buf[32];
     strftime(buf, 32, "%H:%M:%S %d/%m/%Y", &t);
     Serial.println(buf);
@@ -422,19 +397,30 @@ bool isWithinAccessHours() {
 }
 
 // ════════════════════════════════════════════════════════════
+// MIDNIGHT RESET — clears grant and block lists at new day
+// ════════════════════════════════════════════════════════════
+void checkMidnightReset() {
+  if (!timeReady) return;
+  struct tm t;
+  if (!getLocalTime(&t, 100)) return;
+
+  if (grantedDay != t.tm_yday) {
+    grantedCount = 0;
+    grantedDay   = t.tm_yday;
+    Serial.println(F("GRANT: midnight reset"));
+  }
+  if (blockedDay != t.tm_yday) {
+    blockedCount = 0;
+    blockedDay   = t.tm_yday;
+    Serial.println(F("BLOCK: midnight reset"));
+  }
+}
+
+// ════════════════════════════════════════════════════════════
 // DAY GRANT HELPERS
 // ════════════════════════════════════════════════════════════
 bool isGrantedToday(const char* uid) {
-  if (timeReady) {
-    struct tm t;
-    if (getLocalTime(&t, 100)) {
-      if (grantedDay != t.tm_yday) {
-        grantedCount = 0;
-        grantedDay   = t.tm_yday;
-        Serial.println(F("GRANT: midnight reset"));
-      }
-    }
-  }
+  checkMidnightReset();
   for (int i = 0; i < grantedCount; i++) {
     if (strcmp(grantedUIDs[i], uid) == 0) return true;
   }
@@ -454,6 +440,32 @@ void grantDayAccess(const char* uid) {
   strncpy(grantedUIDs[grantedCount++], uid, 10);
   grantedUIDs[grantedCount - 1][10] = '\0';
   Serial.print(F("GRANT: added ")); Serial.println(uid);
+}
+
+// ════════════════════════════════════════════════════════════
+// DAY BLOCK HELPERS
+// ════════════════════════════════════════════════════════════
+bool isBlockedToday(const char* uid) {
+  checkMidnightReset();
+  for (int i = 0; i < blockedCount; i++) {
+    if (strcmp(blockedUIDs[i], uid) == 0) return true;
+  }
+  return false;
+}
+
+void blockDayAccess(const char* uid) {
+  if (isBlockedToday(uid)) {
+    Serial.print(F("BLOCK: already blocked ")); Serial.println(uid);
+    return;
+  }
+  if (blockedCount >= BLOCK_LIST_MAX) {
+    memmove(blockedUIDs[0], blockedUIDs[1],
+            sizeof(blockedUIDs[0]) * (BLOCK_LIST_MAX - 1));
+    blockedCount = BLOCK_LIST_MAX - 1;
+  }
+  strncpy(blockedUIDs[blockedCount++], uid, 10);
+  blockedUIDs[blockedCount - 1][10] = '\0';
+  Serial.print(F("BLOCK: added ")); Serial.println(uid);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -523,9 +535,9 @@ int httpGet(const String& url, String& responseOut) {
 }
 
 // ════════════════════════════════════════════════════════════
-// CHECK WITH SERVER — FIX: ask server before opening door
-// Calls /discord/check/scan, reads role + day_grant from DB,
-// returns verdict string. Falls back to local on failure.
+// CHECK WITH SERVER
+// Ask server for verdict on a known member.
+// Returns verdict string or "" on failure (local fallback).
 // ════════════════════════════════════════════════════════════
 String checkWithServer(const char* uid, const char* name) {
   StaticJsonDocument<128> doc;
@@ -547,7 +559,7 @@ String checkWithServer(const char* uid, const char* name) {
   if (code != 200) {
     http.end();
     Serial.printf("SERVER CHECK FAIL: %d\n", code);
-    return ""; // empty = use local fallback
+    return "";
   }
 
   String resp = http.getString();
@@ -564,30 +576,37 @@ String checkWithServer(const char* uid, const char* name) {
   String role     = respDoc["role"]      | "";
   bool   dayGrant = respDoc["day_grant"] | false;
 
-  Serial.printf("SERVER SAYS: known=%d role=%s dayGrant=%d\n",
+  Serial.printf("SERVER: known=%d role=%s dayGrant=%d\n",
                 known, role.c_str(), dayGrant);
 
-  if (!known)              return "NOT_IN_LIST";
-  if (role == "banned")    return "BANNED";
-  if (role == "pending")   return "DENIED_PENDING";
-
-  // For board/president in DB — grant directly
+  if (!known)                    return "NOT_IN_LIST";
+  if (role == "banned")          return "BANNED";
+  if (role == "pending")         return "DENIED_PENDING";
   if (role == "Exclusive board") return "GRANTED_BOARD";
   if (role == "President")       return "GRANTED_PRESIDENT";
 
-  // Leader logic: day grant overrides time window
-  if (dayGrant)                  return "GRANTED_LEADER_DAY";
-  if (isWithinAccessHours())     return "GRANTED_LEADER";
-
+  if (dayGrant)              return "GRANTED_LEADER_DAY";
+  if (isWithinAccessHours()) return "GRANTED_LEADER";
   return "DENIED_HOURS";
 }
 
 // ════════════════════════════════════════════════════════════
-// ACCESS CHECK — reads local CSV first, then asks server
-// FIX: Leader cards now consult server before deciding
+// ACCESS CHECK
+// Flow:
+//   1. Check block list (unknown cards blocked today)
+//   2. Read CSV — Board/President: local. Leader: ask server.
+//   3. Not in CSV: check block list again, then ask Discord
 // ════════════════════════════════════════════════════════════
 void checkAccess(unsigned long uid) {
   String uidStr = padUID(uid);
+
+  // ── Early exit: blocked today ─────────────────────────────
+  if (isBlockedToday(uidStr.c_str())) {
+    accessDeniedBlocked("Unknown");
+    queueEvent(uidStr.c_str(), "Unknown", "DENIED_BLOCKED_DAY");
+    if (ensureWifi()) flushQueue();
+    return;
+  }
 
   File f = LittleFS.open("/access.csv", "r");
   if (!f) {
@@ -624,19 +643,19 @@ void checkAccess(unsigned long uid) {
 
     found = true;
 
-    // ── Exclusive Board: 100% local, no WiFi needed ───────
+    // ── Exclusive Board: 100% local ───────────────────────
     if (role == "Exclusive board") {
       accessGrantedBoard(name);
       queueEvent(uidStr.c_str(), name.c_str(), "GRANTED_BOARD");
       if (ensureWifi()) flushQueue();
 
-    // ── President: 100% local, no WiFi needed ─────────────
+    // ── President: 100% local ─────────────────────────────
     } else if (role == "President") {
       accessGrantedPresident(name);
       queueEvent(uidStr.c_str(), name.c_str(), "GRANTED_PRESIDENT");
       if (ensureWifi()) flushQueue();
 
-    // ── Leader: FIX — ask server first, fallback to local ─
+    // ── Leader: ask server first, local fallback ──────────
     } else if (role == "Leader") {
       lcdPrint(centerName(name), " Checking...");
 
@@ -664,8 +683,8 @@ void checkAccess(unsigned long uid) {
           sendToServer(uidStr.c_str(), name.c_str(), "DENIED_PENDING");
 
         } else {
-          // Empty verdict = server unreachable — fall back to local
-          Serial.println(F("SERVER UNREACHABLE: using local fallback"));
+          // Server unreachable — local fallback
+          Serial.println(F("SERVER UNREACHABLE: local fallback"));
           bool dayGrant = isGrantedToday(uidStr.c_str());
           if (isWithinAccessHours() || dayGrant) {
             const char* evtResult = dayGrant ? "GRANTED_LEADER_DAY" : "GRANTED_LEADER";
@@ -680,8 +699,8 @@ void checkAccess(unsigned long uid) {
         }
 
       } else {
-        // WiFi unavailable — fully local decision
-        Serial.println(F("WIFI DOWN: local decision for Leader"));
+        // WiFi down — fully local
+        Serial.println(F("WIFI DOWN: local fallback for Leader"));
         bool dayGrant = isGrantedToday(uidStr.c_str());
         if (isWithinAccessHours() || dayGrant) {
           const char* evtResult = dayGrant ? "GRANTED_LEADER_DAY" : "GRANTED_LEADER";
@@ -699,12 +718,6 @@ void checkAccess(unsigned long uid) {
       queueEvent(uidStr.c_str(), name.c_str(), "BANNED");
       if (ensureWifi()) flushQueue();
 
-    // ── Pending ───────────────────────────────────────────
-    } else if (role == "pending") {
-      accessDenied(name, "Not Approved");
-      queueEvent(uidStr.c_str(), name.c_str(), "DENIED_PENDING");
-      if (ensureWifi()) flushQueue();
-
     } else {
       accessDenied(name, "Invalid Role");
       queueEvent(uidStr.c_str(), name.c_str(), "DENIED_ROLE");
@@ -715,13 +728,26 @@ void checkAccess(unsigned long uid) {
   }
   f.close();
 
-  // ── Unknown card — ask server (which asks Discord) ────────
+  // ── Unknown card ─────────────────────────────────────────
+  // Ask Discord EVERY TIME — no DB/CSV save, no memory.
+  // If blocked today, deny silently.
   if (!found) {
+    if (isBlockedToday(uidStr.c_str())) {
+      accessDeniedBlocked("Unknown");
+      queueEvent(uidStr.c_str(), "Unknown", "DENIED_BLOCKED_DAY");
+      if (ensureWifi()) flushQueue();
+      return;
+    }
+
     accessUnknown(uid);
     if (ensureWifi()) {
+      Serial.println(F("-> asking Discord for unknown card"));
       bool serverKnows = scanUnknown(uidStr.c_str());
+      Serial.print(F("-> serverKnows=")); Serial.println(serverKnows);
       if (!serverKnows) {
+        // Truly unknown — Discord was notified with buttons
         queueEvent(uidStr.c_str(), "Unknown", "NOT_IN_LIST");
+        flushQueue();
       }
     } else {
       queueEvent(uidStr.c_str(), "Unknown", "NOT_IN_LIST");
@@ -774,6 +800,11 @@ void accessBanned(String name) {
 
 void accessDeniedHours(String name) {
   lcdPrint(centerName(name), " 10AM-4PM Only");
+  playSound(SND_DENIED);
+}
+
+void accessDeniedBlocked(String name) {
+  lcdPrint("? Blocked Today", " Try Tomorrow");
   playSound(SND_DENIED);
 }
 
@@ -905,6 +936,7 @@ bool scanUnknown(const char* uid) {
   int code = http.POST(body);
   if (code != 200) {
     http.end();
+    Serial.printf("scanUnknown ERR: %d\n", code);
     return false;
   }
 
@@ -1000,6 +1032,14 @@ bool executeCommand(const String& action, const String& uid,
     showIdle();
     return true;
 
+  } else if (action == "block_day") {
+    // Block this UID for today only — RAM, clears at midnight
+    blockDayAccess(uid.c_str());
+    lcdPrint(" Bot: Blocked!", " Until Midnight");
+    delay(1500);
+    showIdle();
+    return true;
+
   } else if (action == "get_status") {
     unsigned long uptimeMs = millis();
     unsigned long upHr  = uptimeMs / 3600000;
@@ -1080,8 +1120,8 @@ bool updateRoleInCSV(const String& targetUID, const String& newRole) {
     String entryName = line.substring(0, c1);       entryName.trim();
     String entryUID  = line.substring(c1 + 1, c2);  entryUID.trim();
 
-    unsigned long entryUIDLong  = strtoul(entryUID.c_str(),   NULL, 10);
-    unsigned long targetUIDLong = strtoul(targetUID.c_str(),  NULL, 10);
+    unsigned long entryUIDLong  = strtoul(entryUID.c_str(),  NULL, 10);
+    unsigned long targetUIDLong = strtoul(targetUID.c_str(), NULL, 10);
 
     if (entryUIDLong == targetUIDLong) {
       tmp.print(entryName); tmp.print(",");

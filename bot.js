@@ -34,7 +34,7 @@ const {
 
 // ── Config ───────────────────────────────────────────────────
 const BOT_TOKEN  = process.env.BOT_TOKEN;
-const CHANNEL_ID = process.env.CHANNEL_ID; // Optional: set a default channel
+const CHANNEL_ID = process.env.CHANNEL_ID;
 
 if (!BOT_TOKEN) {
   console.error("[Bot] ERROR: BOT_TOKEN not set in .env");
@@ -68,15 +68,14 @@ const commands = [
         .addChoices(
           { name: "Leader",         value: "Leader"         },
           { name: "Exclusive board", value: "Exclusive board" },
-          { name: "President",      value: "President"      },
-          { name: "Pending",        value: "pending"        }
+          { name: "President",      value: "President"      }
         )
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("ban")
-    .setDescription("Ban a card by UID")
+    .setDescription("Permanently ban a card by UID")
     .addStringOption((o) =>
       o.setName("uid").setDescription("Card UID").setRequired(true)
     )
@@ -92,7 +91,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("grant_day")
-    .setDescription("Give a Leader full-day access (resets at midnight)")
+    .setDescription("Give a member full-day access (resets at midnight)")
     .addStringOption((o) =>
       o.setName("uid").setDescription("Card UID").setRequired(true)
     )
@@ -113,7 +112,6 @@ const commands = [
           { name: "Leader",         value: "Leader"         },
           { name: "Exclusive board", value: "Exclusive board" },
           { name: "President",      value: "President"      },
-          { name: "Pending",        value: "pending"        },
           { name: "Banned",         value: "banned"         }
         )
     )
@@ -163,7 +161,7 @@ const registerCommands = async () => {
     await rest.put(Routes.applicationCommands(client.user.id), {
       body: commands.map((c) => c.toJSON()),
     });
-    console.log("[Bot] Global slash commands registered OK (may take up to 1 hour to appear in new servers)");
+    console.log("[Bot] Global slash commands registered OK");
   } catch (err) {
     console.error("[Bot] Command registration failed:", err.message);
   }
@@ -175,12 +173,12 @@ const registerCommands = async () => {
 
 const roleEmoji = (role) => {
   switch (role) {
-    case "President":      return "👑";
+    case "President":       return "👑";
     case "Exclusive board": return "⭐";
-    case "Leader":         return "🔑";
-    case "banned":         return "🚫";
-    case "pending":        return "⏳";
-    default:               return "❓";
+    case "Leader":          return "🔑";
+    case "banned":          return "🚫";
+    case "pending":         return "⏳";
+    default:                return "❓";
   }
 };
 
@@ -188,7 +186,8 @@ const resultColor = (result) => {
   if (result.startsWith("GRANTED")) return 0x00c853; // green
   if (result === "BANNED")           return 0xd50000; // red
   if (result === "NOT_IN_LIST")      return 0xff6d00; // orange
-  return 0xffab00;                                   // yellow
+  if (result === "BLOCKED_DAY")      return 0xff6d00; // orange
+  return 0xffab00;                                    // yellow
 };
 
 const resultLabel = (result) => {
@@ -200,6 +199,7 @@ const resultLabel = (result) => {
     DENIED_HOURS:         "⏰ Denied — Outside Hours",
     DENIED_PENDING:       "⏳ Denied — Awaiting Approval",
     DENIED_ROLE:          "❌ Denied — Invalid Role",
+    DENIED_BLOCKED_DAY:   "🚫 Denied — Blocked for Today",
     BANNED:               "🚫 BANNED Card Attempted Entry",
     NOT_IN_LIST:          "❓ Unknown Card Scanned",
   };
@@ -208,6 +208,8 @@ const resultLabel = (result) => {
 
 const formatUID = (uid) => String(uid).padStart(10, "0");
 
+// ── Buttons shown when an unknown card scans ─────────────────
+// 4 buttons: Grant 1 Day | Approve as Leader | Block Today | Ban Card
 const unknownButtons = (uid) =>
   new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -219,9 +221,22 @@ const unknownButtons = (uid) =>
       .setLabel("Approve as Leader")
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
+      .setCustomId(`block_day_${uid}`)
+      .setLabel("Block Today")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
       .setCustomId(`ban_${uid}`)
       .setLabel("Ban Card")
       .setStyle(ButtonStyle.Danger)
+  );
+
+// ── Disabled version after a button is clicked ───────────────
+const disabledButtons = (uid, label) =>
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`grant_day_${uid}`).setLabel("Grant 1 Day").setStyle(ButtonStyle.Success).setDisabled(true),
+    new ButtonBuilder().setCustomId(`approve_${uid}`).setLabel("Approve as Leader").setStyle(ButtonStyle.Primary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`block_day_${uid}`).setLabel(label || "Block Today").setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`ban_${uid}`).setLabel("Ban Card").setStyle(ButtonStyle.Danger).setDisabled(true)
   );
 
 // ════════════════════════════════════════════════════════════
@@ -229,12 +244,10 @@ const unknownButtons = (uid) =>
 // ════════════════════════════════════════════════════════════
 const notifyDiscord = async (payload) => {
   if (!notifyChannel) {
-    // Try to find channel from env if not cached yet
     if (CHANNEL_ID) {
       try {
         notifyChannel = await client.channels.fetch(CHANNEL_ID);
       } catch {
-        // Channel not found yet — silent fail, bot logs to console
         console.warn("[Bot] Notify channel not found:", CHANNEL_ID);
         return;
       }
@@ -292,10 +305,7 @@ const notifyDiscord = async (payload) => {
   // ── LOG REPLY ─────────────────────────────────────────────
   if (result === "LOG_REPLY" && log) {
     const lines = log
-      .map(
-        (e) =>
-          `\`${e.uid}\` **${e.name}** — ${resultLabel(e.result)}`
-      )
+      .map((e) => `\`${e.uid}\` **${e.name}** — ${resultLabel(e.result)}`)
       .join("\n") || "_No log entries_";
     const embed = new EmbedBuilder()
       .setTitle("📜 Recent Scan Log")
@@ -311,12 +321,12 @@ const notifyDiscord = async (payload) => {
       .setTitle("📊 Access Report")
       .setColor(0x9c27b0)
       .addFields(
-        { name: "Total Scans",  value: `${reportData.total}`,   inline: true },
-        { name: "✅ Granted",   value: `${reportData.granted}`, inline: true },
-        { name: "❌ Denied",    value: `${reportData.denied}`,  inline: true },
-        { name: "🚫 Banned",    value: `${reportData.banned}`,  inline: true },
-        { name: "❓ Unknown",   value: `${reportData.unknown}`, inline: true },
-        { name: "🌞 Day Grants",value: `${reportData.day_grants}`, inline: true }
+        { name: "Total Scans",   value: `${reportData.total}`,      inline: true },
+        { name: "✅ Granted",    value: `${reportData.granted}`,    inline: true },
+        { name: "❌ Denied",     value: `${reportData.denied}`,     inline: true },
+        { name: "🚫 Banned",     value: `${reportData.banned}`,     inline: true },
+        { name: "❓ Unknown",    value: `${reportData.unknown}`,    inline: true },
+        { name: "🌞 Day Grants", value: `${reportData.day_grants}`, inline: true }
       )
       .setTimestamp();
     return notifyChannel.send({ embeds: [embed] });
@@ -335,7 +345,7 @@ const notifyDiscord = async (payload) => {
 
     const msgOptions = { embeds: [embed] };
 
-    // Unknown card — add action buttons
+    // Unknown card — add action buttons (ask every time)
     if (askButtons || result === "NOT_IN_LIST") {
       msgOptions.components = [unknownButtons(formatUID(uid))];
     }
@@ -351,15 +361,15 @@ client.on("interactionCreate", async (interaction) => {
 
   // ── BUTTON INTERACTIONS ───────────────────────────────────
   if (interaction.isButton()) {
-  await interaction.deferReply({ ephemeral: false });
-  return handleButton(interaction);
+    await interaction.deferReply({ ephemeral: false }); // PUBLIC reply
+    return handleButton(interaction);
   }
 
   // ── SLASH COMMANDS ────────────────────────────────────────
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName } = interaction;
-  await interaction.deferReply({ ephemeral: false });
+  await interaction.deferReply({ ephemeral: false }); // PUBLIC reply
 
   try {
     switch (commandName) {
@@ -367,7 +377,6 @@ client.on("interactionCreate", async (interaction) => {
       // ── /setchannel ──────────────────────────────────────
       case "setchannel": {
         notifyChannel = interaction.channel;
-        // Persist channel ID to DB so it survives restarts
         const { saveChannelId } = require("./database");
         saveChannelId(interaction.channelId);
         console.log(`[Bot] Notify channel set and saved: ${interaction.channelId}`);
@@ -392,7 +401,6 @@ client.on("interactionCreate", async (interaction) => {
 
         upsertMember(uid, name, role, interaction.user.tag);
 
-        // Queue command so ESP32 updates its CSV too
         const cmdId = `add_${Date.now()}`;
         pushCommand(cmdId, "add", uid, name, role);
 
@@ -470,8 +478,7 @@ client.on("interactionCreate", async (interaction) => {
 
         updateRole(uid, role);
         const cmdId = `setrole_${Date.now()}`;
-        // Map to existing ESP32 commands
-        const espAction = role === "banned" ? "ban" : "unban";
+        const espAction = role === "banned" ? "ban" : "add";
         pushCommand(cmdId, espAction, uid, member.name, role);
 
         return interaction.editReply(
@@ -522,7 +529,6 @@ client.on("interactionCreate", async (interaction) => {
         const rows = [];
         for (const m of pendingList) {
           rows.push(`**${m.name}** — \`${m.uid}\``);
-          // Add action buttons for each pending card
           rows.push(
             `> Use \`/grant_day uid:${m.uid}\` · \`/add\` to approve · \`/ban uid:${m.uid}\` to ban`
           );
@@ -567,15 +573,14 @@ client.on("interactionCreate", async (interaction) => {
           .setTitle("📊 Access Control Report")
           .setColor(0x9c27b0)
           .addFields(
-            { name: "Total Scans",  value: `${total}`,          inline: true },
-            { name: "✅ Granted",   value: `${stats.granted || 0} (${grantPct}%)`, inline: true },
-            { name: "❌ Denied",    value: `${stats.denied  || 0}`, inline: true },
-            { name: "🚫 Banned",    value: `${stats.banned  || 0}`, inline: true },
-            { name: "❓ Unknown",   value: `${stats.unknown || 0}`, inline: true }
+            { name: "Total Scans", value: `${total}`,                              inline: true },
+            { name: "✅ Granted",  value: `${stats.granted || 0} (${grantPct}%)`, inline: true },
+            { name: "❌ Denied",   value: `${stats.denied  || 0}`,                inline: true },
+            { name: "🚫 Banned",   value: `${stats.banned  || 0}`,                inline: true },
+            { name: "❓ Unknown",  value: `${stats.unknown || 0}`,                inline: true }
           )
           .setTimestamp();
 
-        // Also queue get_report so ESP32 sends its own stats
         const cmdId = `rpt_${Date.now()}`;
         pushCommand(cmdId, "get_report");
 
@@ -602,49 +607,60 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ════════════════════════════════════════════════════════════
-// BUTTON HANDLER (extracted for clarity)
+// BUTTON HANDLER
+// Buttons: grant_day | approve | block_day | ban
 // ════════════════════════════════════════════════════════════
 async function handleButton(interaction) {
   const id = interaction.customId;
 
-  // grant_day_<uid>
+  // ── Grant 1 Day ──────────────────────────────────────────
   if (id.startsWith("grant_day_")) {
     const uid = id.replace("grant_day_", "");
     grantDay(uid);
     const cmdId = `grantday_${Date.now()}`;
     pushCommand(cmdId, "grant_day", uid);
 
-    await interaction.editReply(`🌞 Full-day access granted for UID \`${uid}\`.`);
+    await interaction.editReply(`🌞 Full-day access granted for UID \`${uid}\`. They can now enter until midnight.`);
 
-    // Update the original message buttons to disabled
     try {
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`grant_day_${uid}`).setLabel("✅ Day Granted").setStyle(ButtonStyle.Success).setDisabled(true),
-        new ButtonBuilder().setCustomId(`approve_${uid}`).setLabel("Approve as Leader").setStyle(ButtonStyle.Primary).setDisabled(true),
-        new ButtonBuilder().setCustomId(`ban_${uid}`).setLabel("Ban Card").setStyle(ButtonStyle.Danger).setDisabled(true)
-      );
-      await interaction.message.edit({ components: [row] });
+      await interaction.message.edit({
+        components: [disabledButtons(uid, "✅ Day Granted")]
+      });
     } catch {}
 
-  // approve_<uid>
+  // ── Approve as Leader ────────────────────────────────────
   } else if (id.startsWith("approve_")) {
     const uid = id.replace("approve_", "");
     upsertMember(uid, "Unknown", "Leader", interaction.user.tag);
     const cmdId = `approve_${Date.now()}`;
     pushCommand(cmdId, "add", uid, "Unknown", "Leader");
 
-    await interaction.editReply(`✅ UID \`${uid}\` approved as **Leader**. Use \`/setrole\` to rename them.`);
+    await interaction.editReply(`✅ UID \`${uid}\` approved as **Leader**. Use \`/setrole\` to set their name.`);
 
     try {
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`grant_day_${uid}`).setLabel("Grant 1 Day").setStyle(ButtonStyle.Success).setDisabled(true),
-        new ButtonBuilder().setCustomId(`approve_${uid}`).setLabel("✅ Approved").setStyle(ButtonStyle.Primary).setDisabled(true),
-        new ButtonBuilder().setCustomId(`ban_${uid}`).setLabel("Ban Card").setStyle(ButtonStyle.Danger).setDisabled(true)
-      );
-      await interaction.message.edit({ components: [row] });
+      await interaction.message.edit({
+        components: [disabledButtons(uid, "✅ Approved")]
+      });
     } catch {}
 
-  // ban_<uid>
+  // ── Block for Today ──────────────────────────────────────
+  // Sends a block_day command to ESP32 — ESP stores UID in
+  // a blocked list in RAM, cleared at midnight like day grants.
+  // Does NOT permanently save anything to DB or CSV.
+  } else if (id.startsWith("block_day_")) {
+    const uid = id.replace("block_day_", "");
+    const cmdId = `blockday_${Date.now()}`;
+    pushCommand(cmdId, "block_day", uid);
+
+    await interaction.editReply(`🚫 UID \`${uid}\` blocked for today. They will be asked again tomorrow.`);
+
+    try {
+      await interaction.message.edit({
+        components: [disabledButtons(uid, "🚫 Blocked Today")]
+      });
+    } catch {}
+
+  // ── Permanent Ban ────────────────────────────────────────
   } else if (id.startsWith("ban_")) {
     const uid = id.replace("ban_", "");
     upsertMember(uid, "Unknown", "banned", interaction.user.tag);
@@ -652,15 +668,12 @@ async function handleButton(interaction) {
     const cmdId = `ban_${Date.now()}`;
     pushCommand(cmdId, "ban", uid);
 
-    await interaction.editReply(`🚫 UID \`${uid}\` has been **banned**.`);
+    await interaction.editReply(`🚫 UID \`${uid}\` has been **permanently banned**.`);
 
     try {
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`grant_day_${uid}`).setLabel("Grant 1 Day").setStyle(ButtonStyle.Success).setDisabled(true),
-        new ButtonBuilder().setCustomId(`approve_${uid}`).setLabel("Approve as Leader").setStyle(ButtonStyle.Primary).setDisabled(true),
-        new ButtonBuilder().setCustomId(`ban_${uid}`).setLabel("🚫 Banned").setStyle(ButtonStyle.Danger).setDisabled(true)
-      );
-      await interaction.message.edit({ components: [row] });
+      await interaction.message.edit({
+        components: [disabledButtons(uid, "🚫 Banned")]
+      });
     } catch {}
 
   } else {
@@ -675,7 +688,6 @@ client.once("ready", async () => {
   console.log(`[Bot] Logged in as ${client.user.tag}`);
   await registerCommands();
 
-  // Load saved channel ID from DB first, then fall back to env CHANNEL_ID
   const { getChannelId } = require("./database");
   const savedChannelId = getChannelId() || CHANNEL_ID;
 
