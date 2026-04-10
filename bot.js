@@ -459,15 +459,23 @@ client.on("interactionCreate", async (interaction) => {
         );
       }
 
-      case "add": {
+      case "setrole": {
         const uid  = formatUID(interaction.options.getString("uid").trim());
-        const name = interaction.options.getString("name").trim();
         const role = interaction.options.getString("role");
+        const member = getMember(uid);
 
-        upsertMember(uid, name, role, interaction.user.tag);
-        pushCommand(`add_${Date.now()}`, "add", uid, name, role, 0);
+        if (!member) {
+          return interaction.editReply(`❌ UID \`${uid}\` not found in database.`);
+        }
 
-        return interaction.editReply(`✅ **${name}** added as **${role}**.`);
+        updateRole(uid, role);
+        
+        // Send "setrole" action instead of ban/add
+        pushCommand(`setrole_${Date.now()}`, "setrole", uid, member.name, role, 0);
+
+        return interaction.editReply(
+          `✅ **${member.name}** role changed to **${role}** (UID: \`${uid}\`)`
+        );
       }
 
       case "ban": {
