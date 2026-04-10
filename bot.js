@@ -650,7 +650,6 @@ async function handleButton(interaction) {
   const uid = id.split('_').pop();
   const existing = getMember(uid);
 
-  // If unknown, initialize as pending
   if (!existing) {
     upsertMember(uid, "Unknown", "pending", interaction.user.tag);
   }
@@ -675,7 +674,6 @@ async function handleButton(interaction) {
     });
 
   } else if (id.startsWith("block_day_")) {
-    // "Deny" just logs it and tells the ESP32 to ignore it for now
     logScan(uid, "Unknown", "DENIED_BLOCKED_DAY");
     pushCommand(`block_${Date.now()}`, "block_day", uid);
 
@@ -695,7 +693,6 @@ async function handleButton(interaction) {
     });
   }
 }
-
 // ════════════════════════════════════════════════════════════
 // BOT READY
 // ════════════════════════════════════════════════════════════
