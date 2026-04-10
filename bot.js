@@ -351,7 +351,7 @@ client.on("interactionCreate", async (interaction) => {
 
   // ── BUTTON INTERACTIONS ───────────────────────────────────
   if (interaction.isButton()) {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ ephemeral: false });
   return handleButton(interaction);
   }
 
@@ -359,7 +359,7 @@ client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName } = interaction;
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ ephemeral: false });
 
   try {
     switch (commandName) {

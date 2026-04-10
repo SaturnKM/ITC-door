@@ -33,6 +33,10 @@ TIME RULES:
   Board       → 24/7 (no WiFi needed)
   President   → 24/7 (no WiFi needed) + fun message
 
+FIX: Leader cards now ask the server before opening the door.
+     Server checks day grants, role overrides, bans in DB.
+     Falls back to local logic if WiFi is unavailable.
+
 CSV format : Full Name,UID,Role
 Roles      : Exclusive board | President | Leader | banned | pending
 ============================================================ */
@@ -67,7 +71,7 @@ const char* WIFI_SSID   = "DOOR_ACCESS";
 const char* WIFI_PASS   = "DOOR_ACCESS";
 
 // Your deployment URL
-const char* SERVER_URL  = "https://rfid.robtic.org/";
+const char* SERVER_URL  = "https://rfid.robtic.org";
 
 // Must match API_KEY in your Railway environment variables
 const char* API_KEY     = "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+";
@@ -83,14 +87,12 @@ const unsigned long SCAN_COOLDOWN_MS  = 8000;
 const unsigned long DOOR_OPEN_MS      = 3000;
 const unsigned long LED_HOLD_MS       = 1500;
 const unsigned long POLL_INTERVAL_MS  = 5000;
-const unsigned long NTP_RETRY_MS      = 30000; // retry NTP if it fails
+const unsigned long NTP_RETRY_MS      = 30000;
 
 #define QUEUE_MAX 30
 
 // ════════════════════════════════════════════════════════════
 // EMBEDDED ACCESS LIST (local offline cache for board/president)
-// The server SQLite DB is the master — this is just for 24/7
-// offline access for Exclusive board and President cards.
 // ════════════════════════════════════════════════════════════
 const char* DEFAULT_CSV =
   "Full Name,UID,Role\n"
@@ -149,10 +151,10 @@ int presidentMsgIdx = 0;
 // ════════════════════════════════════════════════════════════
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-unsigned long lastScanTime    = 0;
-unsigned long lastPollTime    = 0;
+unsigned long lastScanTime     = 0;
+unsigned long lastPollTime     = 0;
 unsigned long lastClockRefresh = 0;
-unsigned long lastNtpAttempt  = 0;
+unsigned long lastNtpAttempt   = 0;
 
 bool fsReady       = false;
 bool wifiConnected = false;
@@ -169,9 +171,9 @@ int queueCount = 0;
 
 // ── Temporary full-day grants (from bot command) ─────────────
 #define GRANT_LIST_MAX 20
-char    grantedUIDs[GRANT_LIST_MAX][11];
-int     grantedCount = 0;
-int     grantedDay   = -1;
+char grantedUIDs[GRANT_LIST_MAX][11];
+int  grantedCount = 0;
+int  grantedDay   = -1;
 
 // ════════════════════════════════════════════════════════════
 // FORWARD DECLARATIONS
@@ -189,6 +191,7 @@ void     checkAccess(unsigned long uid);
 void     flushQueue();
 bool     sendToServer(const char* uid, const char* name, const char* result);
 bool     scanUnknown(const char* uid);
+String   checkWithServer(const char* uid, const char* name);
 void     pollCommands();
 bool     executeCommand(const String& action, const String& uid,
                         const String& name, const String& role, int count);
@@ -209,6 +212,8 @@ unsigned long readUID();
 void     flushRFID();
 bool     isWithinAccessHours();
 String   buildURL(const char* path);
+int      httpPost(const String& url, const String& body);
+int      httpGet(const String& url, String& responseOut);
 
 // ════════════════════════════════════════════════════════════
 // SETUP
@@ -239,7 +244,6 @@ void setup() {
     fsReady = true;
     Serial.println(F("STARTUP_OK: LittleFS mounted"));
 
-    // BUG FIX: was checking first char isDigit() which fails on header line
     if (!LittleFS.exists("/access.csv") || FORCE_REWRITE) {
       lcdPrint(" Writing list...", " Please wait");
       File f = LittleFS.open("/access.csv", "w");
@@ -358,7 +362,7 @@ bool ensureWifi() {
 }
 
 // ════════════════════════════════════════════════════════════
-// NTP — BUG FIX: retry loop with proper timeout
+// NTP
 // ════════════════════════════════════════════════════════════
 bool syncNTP() {
   lastNtpAttempt = millis();
@@ -443,7 +447,6 @@ void grantDayAccess(const char* uid) {
     return;
   }
   if (grantedCount >= GRANT_LIST_MAX) {
-    // Drop oldest
     memmove(grantedUIDs[0], grantedUIDs[1],
             sizeof(grantedUIDs[0]) * (GRANT_LIST_MAX - 1));
     grantedCount = GRANT_LIST_MAX - 1;
@@ -465,8 +468,6 @@ unsigned long readUID() {
       if (isHexadecimalDigit(c)) data += c;
     }
   }
-  // RDM6300 sends: 02 [2 version] [8 data] [2 checksum] 03
-  // We grab 8 hex chars from position 2
   if (data.length() >= 10) {
     String hexPart = data.substring(2, 10);
     char buf[9];
@@ -487,15 +488,107 @@ String padUID(unsigned long uid) {
 }
 
 // ════════════════════════════════════════════════════════════
-// ACCESS CHECK — reads local CSV
-// BUG FIX: proper header skip (check for "Full Name" header)
-// BUG FIX: UID stored as padded string in CSV for consistency
+// HTTP HELPERS
+// ════════════════════════════════════════════════════════════
+int httpPost(const String& url, const String& body) {
+  if (!wifiConnected) return -1;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-api-key", API_KEY);
+  http.setTimeout(5000);
+
+  int code = http.POST(body);
+  http.end();
+  return code;
+}
+
+int httpGet(const String& url, String& responseOut) {
+  if (!wifiConnected) return -1;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("x-api-key", API_KEY);
+  http.setTimeout(5000);
+
+  int code = http.GET();
+  if (code == 200) responseOut = http.getString();
+  http.end();
+  return code;
+}
+
+// ════════════════════════════════════════════════════════════
+// CHECK WITH SERVER — FIX: ask server before opening door
+// Calls /discord/check/scan, reads role + day_grant from DB,
+// returns verdict string. Falls back to local on failure.
+// ════════════════════════════════════════════════════════════
+String checkWithServer(const char* uid, const char* name) {
+  StaticJsonDocument<128> doc;
+  doc["uid"]  = uid;
+  doc["name"] = name;
+
+  String body;
+  serializeJson(doc, body);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, buildURL("/discord/check/scan"));
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-api-key", API_KEY);
+  http.setTimeout(5000);
+
+  int code = http.POST(body);
+  if (code != 200) {
+    http.end();
+    Serial.printf("SERVER CHECK FAIL: %d\n", code);
+    return ""; // empty = use local fallback
+  }
+
+  String resp = http.getString();
+  http.end();
+
+  StaticJsonDocument<256> respDoc;
+  DeserializationError err = deserializeJson(respDoc, resp);
+  if (err) {
+    Serial.print(F("SERVER CHECK JSON ERR: ")); Serial.println(err.c_str());
+    return "";
+  }
+
+  bool   known    = respDoc["known"]     | false;
+  String role     = respDoc["role"]      | "";
+  bool   dayGrant = respDoc["day_grant"] | false;
+
+  Serial.printf("SERVER SAYS: known=%d role=%s dayGrant=%d\n",
+                known, role.c_str(), dayGrant);
+
+  if (!known)              return "NOT_IN_LIST";
+  if (role == "banned")    return "BANNED";
+  if (role == "pending")   return "DENIED_PENDING";
+
+  // For board/president in DB — grant directly
+  if (role == "Exclusive board") return "GRANTED_BOARD";
+  if (role == "President")       return "GRANTED_PRESIDENT";
+
+  // Leader logic: day grant overrides time window
+  if (dayGrant)                  return "GRANTED_LEADER_DAY";
+  if (isWithinAccessHours())     return "GRANTED_LEADER";
+
+  return "DENIED_HOURS";
+}
+
+// ════════════════════════════════════════════════════════════
+// ACCESS CHECK — reads local CSV first, then asks server
+// FIX: Leader cards now consult server before deciding
 // ════════════════════════════════════════════════════════════
 void checkAccess(unsigned long uid) {
   String uidStr = padUID(uid);
 
-  // ── For board/president: fully local ─────────────────────
-  // First pass: just check if it's a local-only role
   File f = LittleFS.open("/access.csv", "r");
   if (!f) {
     lcdPrint("  No access.csv", " Upload via IDE");
@@ -504,7 +597,7 @@ void checkAccess(unsigned long uid) {
     return;
   }
 
-  bool found    = false;
+  bool found     = false;
   bool firstLine = true;
 
   while (f.available()) {
@@ -512,7 +605,6 @@ void checkAccess(unsigned long uid) {
     line.trim();
     if (line.length() == 0) continue;
 
-    // BUG FIX: skip header by checking content, not char type
     if (firstLine) {
       firstLine = false;
       if (line.startsWith("Full Name") || line.startsWith("full name")) continue;
@@ -521,11 +613,10 @@ void checkAccess(unsigned long uid) {
     int c1 = line.indexOf(',');           if (c1 == -1) continue;
     int c2 = line.indexOf(',', c1 + 1);  if (c2 == -1) continue;
 
-    String name      = line.substring(0, c1);       name.trim();
-    String csvUID    = line.substring(c1 + 1, c2);  csvUID.trim();
-    String role      = line.substring(c2 + 1);       role.trim();
+    String name   = line.substring(0, c1);       name.trim();
+    String csvUID = line.substring(c1 + 1, c2);  csvUID.trim();
+    String role   = line.substring(c2 + 1);       role.trim();
 
-    // Normalize CSV UID to padded format
     unsigned long csvUIDLong = strtoul(csvUID.c_str(), NULL, 10);
     String csvUIDPadded = padUID(csvUIDLong);
 
@@ -533,30 +624,73 @@ void checkAccess(unsigned long uid) {
 
     found = true;
 
-    // ── Exclusive Board: 100% local, no WiFi ─────────────
+    // ── Exclusive Board: 100% local, no WiFi needed ───────
     if (role == "Exclusive board") {
       accessGrantedBoard(name);
       queueEvent(uidStr.c_str(), name.c_str(), "GRANTED_BOARD");
+      if (ensureWifi()) flushQueue();
 
-    // ── President: 100% local, no WiFi ───────────────────
+    // ── President: 100% local, no WiFi needed ─────────────
     } else if (role == "President") {
       accessGrantedPresident(name);
       queueEvent(uidStr.c_str(), name.c_str(), "GRANTED_PRESIDENT");
+      if (ensureWifi()) flushQueue();
 
-    // ── Leader: local decision, WiFi for logging ──────────
+    // ── Leader: FIX — ask server first, fallback to local ─
     } else if (role == "Leader") {
-      lcdPrint(centerName(name), "Status: Pending");
-      bool dayGrant = isGrantedToday(uidStr.c_str());
+      lcdPrint(centerName(name), " Checking...");
 
-      if (isWithinAccessHours() || dayGrant) {
-        const char* evtResult = dayGrant ? "GRANTED_LEADER_DAY" : "GRANTED_LEADER";
-        accessGrantedLeader(name, dayGrant);
-        queueEvent(uidStr.c_str(), name.c_str(), evtResult);
-        if (ensureWifi()) flushQueue();
+      if (ensureWifi()) {
+        String verdict = checkWithServer(uidStr.c_str(), name.c_str());
+
+        if (verdict == "GRANTED_LEADER") {
+          accessGrantedLeader(name, false);
+          sendToServer(uidStr.c_str(), name.c_str(), "GRANTED_LEADER");
+
+        } else if (verdict == "GRANTED_LEADER_DAY") {
+          accessGrantedLeader(name, true);
+          sendToServer(uidStr.c_str(), name.c_str(), "GRANTED_LEADER_DAY");
+
+        } else if (verdict == "DENIED_HOURS") {
+          accessDeniedHours(name);
+          sendToServer(uidStr.c_str(), name.c_str(), "DENIED_HOURS");
+
+        } else if (verdict == "BANNED") {
+          accessBanned(name);
+          sendToServer(uidStr.c_str(), name.c_str(), "BANNED");
+
+        } else if (verdict == "DENIED_PENDING") {
+          accessDenied(name, "Not Approved");
+          sendToServer(uidStr.c_str(), name.c_str(), "DENIED_PENDING");
+
+        } else {
+          // Empty verdict = server unreachable — fall back to local
+          Serial.println(F("SERVER UNREACHABLE: using local fallback"));
+          bool dayGrant = isGrantedToday(uidStr.c_str());
+          if (isWithinAccessHours() || dayGrant) {
+            const char* evtResult = dayGrant ? "GRANTED_LEADER_DAY" : "GRANTED_LEADER";
+            accessGrantedLeader(name, dayGrant);
+            queueEvent(uidStr.c_str(), name.c_str(), evtResult);
+            flushQueue();
+          } else {
+            accessDeniedHours(name);
+            queueEvent(uidStr.c_str(), name.c_str(), "DENIED_HOURS");
+            flushQueue();
+          }
+        }
+
       } else {
-        accessDeniedHours(name);
-        queueEvent(uidStr.c_str(), name.c_str(), "DENIED_HOURS");
-        if (ensureWifi()) flushQueue();
+        // WiFi unavailable — fully local decision
+        Serial.println(F("WIFI DOWN: local decision for Leader"));
+        bool dayGrant = isGrantedToday(uidStr.c_str());
+        if (isWithinAccessHours() || dayGrant) {
+          const char* evtResult = dayGrant ? "GRANTED_LEADER_DAY" : "GRANTED_LEADER";
+          accessGrantedLeader(name, dayGrant);
+          queueEvent(uidStr.c_str(), name.c_str(), evtResult);
+        } else {
+          accessDeniedHours(name);
+          queueEvent(uidStr.c_str(), name.c_str(), "DENIED_HOURS");
+        }
       }
 
     // ── Banned ────────────────────────────────────────────
@@ -585,11 +719,8 @@ void checkAccess(unsigned long uid) {
   if (!found) {
     accessUnknown(uid);
     if (ensureWifi()) {
-      // Ask server — it returns whether the card is known
-      // (could have been added via bot while card wasn't in local CSV)
       bool serverKnows = scanUnknown(uidStr.c_str());
       if (!serverKnows) {
-        // Truly unknown — already notified Discord via server
         queueEvent(uidStr.c_str(), "Unknown", "NOT_IN_LIST");
       }
     } else {
@@ -668,10 +799,10 @@ void openDoor() {
 void playSound(int soundType) {
   if (ACTIVE_BUZZER) {
     int times = 1;
-    if (soundType == SND_BANNED || soundType == SND_ERROR)     times = 3;
+    if (soundType == SND_BANNED || soundType == SND_ERROR)        times = 3;
     else if (soundType == SND_UNKNOWN || soundType == SND_DENIED) times = 2;
-    else if (soundType == SND_GRANTED_PRESIDENT)               times = 3;
-    else if (soundType == SND_WIFI_OK)                         times = 2;
+    else if (soundType == SND_GRANTED_PRESIDENT)                  times = 3;
+    else if (soundType == SND_WIFI_OK)                            times = 2;
     for (int i = 0; i < times; i++) {
       digitalWrite(SIGNAL_PIN, HIGH); delay(200);
       digitalWrite(SIGNAL_PIN, LOW);
@@ -714,13 +845,12 @@ void playSound(int soundType) {
 }
 
 // ════════════════════════════════════════════════════════════
-// EVENT QUEUE (RAM buffer for offline events)
+// EVENT QUEUE
 // ════════════════════════════════════════════════════════════
 void queueEvent(const char* uid, const char* name, const char* result) {
   Serial.printf("EVENT: %s | %s | %s\n", uid, name, result);
 
   if (queueCount >= QUEUE_MAX) {
-    // Drop oldest
     memmove(&eventQueue[0], &eventQueue[1],
             sizeof(QueueEntry) * (QUEUE_MAX - 1));
     queueCount = QUEUE_MAX - 1;
@@ -730,42 +860,6 @@ void queueEvent(const char* uid, const char* name, const char* result) {
   strncpy(eventQueue[queueCount].name,   name,   23); eventQueue[queueCount].name[23]   = '\0';
   strncpy(eventQueue[queueCount].result, result, 27); eventQueue[queueCount].result[27] = '\0';
   queueCount++;
-}
-
-// ════════════════════════════════════════════════════════════
-// HTTP HELPER — POST JSON to server with API key
-// ════════════════════════════════════════════════════════════
-int httpPost(const String& url, const String& body) {
-  if (!wifiConnected) return -1;
-
-  WiFiClientSecure client;
-  client.setInsecure(); // Skip cert validation — Railway uses valid certs
-                        // but we skip for simplicity on ESP32-C3
-  HTTPClient http;
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-api-key", API_KEY);
-  http.setTimeout(5000);
-
-  int code = http.POST(body);
-  http.end();
-  return code;
-}
-
-int httpGet(const String& url, String& responseOut) {
-  if (!wifiConnected) return -1;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, url);
-  http.addHeader("x-api-key", API_KEY);
-  http.setTimeout(5000);
-
-  int code = http.GET();
-  if (code == 200) responseOut = http.getString();
-  http.end();
-  return code;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -846,7 +940,7 @@ void flushQueue() {
 }
 
 // ════════════════════════════════════════════════════════════
-// POLL COMMANDS — BUG FIX: uses ArduinoJson, no manual parsing
+// POLL COMMANDS
 // ════════════════════════════════════════════════════════════
 void pollCommands() {
   String payload;
@@ -860,7 +954,6 @@ void pollCommands() {
     return;
   }
 
-  // Deserialize: {"commands":[{...},{...}]}
   DynamicJsonDocument doc(2048);
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
@@ -914,14 +1007,14 @@ bool executeCommand(const String& action, const String& uid,
     unsigned long upSec = (uptimeMs % 60000) / 1000;
 
     StaticJsonDocument<256> doc;
-    doc["uptime_h"]   = upHr;
-    doc["uptime_m"]   = upMin;
-    doc["uptime_s"]   = upSec;
-    doc["queue_count"]= queueCount;
-    doc["wifi_rssi"]  = WiFi.RSSI();
-    doc["free_heap"]  = ESP.getFreeHeap();
-    doc["time_ready"] = timeReady;
-    doc["day_grants"] = grantedCount;
+    doc["uptime_h"]    = upHr;
+    doc["uptime_m"]    = upMin;
+    doc["uptime_s"]    = upSec;
+    doc["queue_count"] = queueCount;
+    doc["wifi_rssi"]   = WiFi.RSSI();
+    doc["free_heap"]   = ESP.getFreeHeap();
+    doc["time_ready"]  = timeReady;
+    doc["day_grants"]  = grantedCount;
 
     String body;
     serializeJson(doc, body);
@@ -929,7 +1022,6 @@ bool executeCommand(const String& action, const String& uid,
     return (code >= 200 && code < 300);
 
   } else if (action == "get_report") {
-    // Stats are tracked server-side now; just send a minimal local report
     StaticJsonDocument<128> doc;
     doc["queue_count"] = queueCount;
     doc["free_heap"]   = ESP.getFreeHeap();
@@ -985,12 +1077,11 @@ bool updateRoleInCSV(const String& targetUID, const String& newRole) {
     int c2 = line.indexOf(',', c1 + 1);
     if (c1 == -1 || c2 == -1) { tmp.println(line); continue; }
 
-    String entryName = line.substring(0, c1);          entryName.trim();
-    String entryUID  = line.substring(c1 + 1, c2);    entryUID.trim();
+    String entryName = line.substring(0, c1);       entryName.trim();
+    String entryUID  = line.substring(c1 + 1, c2);  entryUID.trim();
 
-    // Compare normalized UIDs
-    unsigned long entryUIDLong = strtoul(entryUID.c_str(), NULL, 10);
-    unsigned long targetUIDLong = strtoul(targetUID.c_str(), NULL, 10);
+    unsigned long entryUIDLong  = strtoul(entryUID.c_str(),   NULL, 10);
+    unsigned long targetUIDLong = strtoul(targetUID.c_str(),  NULL, 10);
 
     if (entryUIDLong == targetUIDLong) {
       tmp.print(entryName); tmp.print(",");
@@ -1017,7 +1108,6 @@ bool updateRoleInCSV(const String& targetUID, const String& newRole) {
 bool addToCSV(const String& uid, const String& name, const String& role) {
   if (uid.length() == 0 || name.length() == 0 || role.length() == 0) return false;
 
-  // Don't add duplicates
   String uidPadded = padUID(strtoul(uid.c_str(), NULL, 10));
   File check = LittleFS.open("/access.csv", "r");
   if (check) {
@@ -1025,7 +1115,7 @@ bool addToCSV(const String& uid, const String& name, const String& role) {
       String line = check.readStringUntil('\n');
       if (line.indexOf(uidPadded) != -1) {
         check.close();
-        return updateRoleInCSV(uid, role); // Update role if already exists
+        return updateRoleInCSV(uid, role);
       }
     }
     check.close();
@@ -1033,7 +1123,7 @@ bool addToCSV(const String& uid, const String& name, const String& role) {
 
   File f = LittleFS.open("/access.csv", "a");
   if (!f) return false;
-  f.print(name);     f.print(",");
+  f.print(name);      f.print(",");
   f.print(uidPadded); f.print(",");
   f.println(role);
   f.close();
