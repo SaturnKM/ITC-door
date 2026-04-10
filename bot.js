@@ -70,7 +70,8 @@ const commands = [
         .addChoices(
           { name: "Leader",          value: "Leader"         },
           { name: "Exclusive board", value: "Exclusive board" },
-          { name: "President",       value: "President"      }
+          { name: "President",       value: "President"      },
+          { name: "Member", value: "Member" }
         )
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
@@ -228,7 +229,7 @@ const formatUID = (uid) => String(uid).padStart(10, "0");
 // "Block Today" blocks UID in ESP RAM until midnight.
 // "Ban Card"    permanently bans UID in DB + ESP CSV.
 // ════════════════════════════════════════════════════════════
-// 🟢 Grant Once | 🟡 Grant 1 Day | ⚫ Denied | 🔴 Ban Card
+// 🟢 Grant Once | 🟡 Grant 1 Day | ⚫ Denied | 👤 Add Member
 const unknownButtons = (uid) =>
   new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -243,39 +244,26 @@ const unknownButtons = (uid) =>
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`block_day_${uid}`)
-      .setLabel("Deny Today")
+      .setLabel("Denied")
       .setEmoji("⚫")
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
-      .setCustomId(`ban_${uid}`)
-      .setLabel("Ban Card")
-      .setEmoji("🔴")
-      .setStyle(ButtonStyle.Danger)
+      .setCustomId(`add_member_${uid}`)
+      .setLabel("Add Member")
+      .setEmoji("👤")
+      .setStyle(ButtonStyle.Primary)
   );
 
-// Shows the result after you click one
 const disabledButtons = (uid, activeLabel, activeStyle) =>
   new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`grant_once_${uid}`)
-      .setLabel(activeStyle === ButtonStyle.Success ? activeLabel : "Grant Once")
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(true),
+      .setCustomId(`btn1_${uid}`).setLabel("Grant Once").setStyle(ButtonStyle.Success).setDisabled(true),
     new ButtonBuilder()
-      .setCustomId(`grant_day_${uid}`)
-      .setLabel(activeStyle === ButtonStyle.Primary ? activeLabel : "Grant 1 Day")
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(true),
+      .setCustomId(`btn2_${uid}`).setLabel("Grant 1 Day").setStyle(ButtonStyle.Primary).setDisabled(true),
     new ButtonBuilder()
-      .setCustomId(`block_day_${uid}`)
-      .setLabel(activeStyle === ButtonStyle.Secondary ? activeLabel : "Denied")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(true),
+      .setCustomId(`btn3_${uid}`).setLabel("Denied").setStyle(ButtonStyle.Secondary).setDisabled(true),
     new ButtonBuilder()
-      .setCustomId(`ban_${uid}`)
-      .setLabel(activeStyle === ButtonStyle.Danger ? activeLabel : "Ban Card")
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled(true)
+      .setCustomId(`btn4_${uid}`).setLabel(activeLabel).setStyle(activeStyle).setDisabled(true)
   );
 
 // ════════════════════════════════════════════════════════════
@@ -650,49 +638,28 @@ client.on("interactionCreate", async (interaction) => {
 async function handleButton(interaction) {
   const id = interaction.customId;
   const uid = id.split('_').pop();
-  const existing = getMember(uid);
-
-  if (!existing) {
-    upsertMember(uid, "Unknown", "pending", interaction.user.tag);
-  }
 
   if (id.startsWith("grant_once_")) {
-    logScan(uid, "Unknown", "GRANTED_ONCE");
     pushCommand(`once_${Date.now()}`, "grant_once", uid);
-
-    await interaction.editReply(`🟢 **One-time access** granted for UID: \`${uid}\`.`);
-    await interaction.message.edit({
-      components: [disabledButtons(uid, "🟢 Once Granted", ButtonStyle.Success)],
-    });
+    await interaction.editReply(`🟢 **Once Granted** for UID: \`${uid}\`.`);
+    await interaction.message.edit({ components: [disabledButtons(uid, "🟢 Granted", ButtonStyle.Success)] });
 
   } else if (id.startsWith("grant_day_")) {
     grantDay(uid);
-    logScan(uid, "Unknown", "GRANTED_LEADER_DAY");
     pushCommand(`day_${Date.now()}`, "grant_day", uid);
-
-    await interaction.editReply(`🟡 **Full-day access** granted for UID: \`${uid}\`.`);
-    await interaction.message.edit({
-      components: [disabledButtons(uid, "🟡 Day Granted", ButtonStyle.Primary)],
-    });
+    await interaction.editReply(`🟡 **Day Granted** for UID: \`${uid}\`.`);
+    await interaction.message.edit({ components: [disabledButtons(uid, "🟡 Day Granted", ButtonStyle.Primary)] });
 
   } else if (id.startsWith("block_day_")) {
-    logScan(uid, "Unknown", "DENIED_BLOCKED_DAY");
     pushCommand(`block_${Date.now()}`, "block_day", uid);
+    await interaction.editReply(`⚫ **Access Denied** for UID: \`${uid}\`.`);
+    await interaction.message.edit({ components: [disabledButtons(uid, "⚫ Denied", ButtonStyle.Secondary)] });
 
-    await interaction.editReply(`⚫ Access **Denied** for UID: \`${uid}\` (Blocked for today).`);
-    await interaction.message.edit({
-      components: [disabledButtons(uid, "⚫ Denied", ButtonStyle.Secondary)],
-    });
-
-  } else if (id.startsWith("ban_")) {
-    updateRole(uid, "banned");
-    logScan(uid, "Unknown", "BANNED");
-    pushCommand(`ban_${Date.now()}`, "ban", uid);
-
-    await interaction.editReply(`🔴 UID \`${uid}\` has been **permanently banned**.`);
-    await interaction.message.edit({
-      components: [disabledButtons(uid, "🔴 Banned", ButtonStyle.Danger)],
-    });
+  } else if (id.startsWith("add_member_")) {
+    upsertMember(uid, "New Member", "Member", interaction.user.tag);
+    pushCommand(`add_${Date.now()}`, "add_member", uid); // Tells ESP32 to save locally
+    await interaction.editReply(`👤 UID \`${uid}\` added as a **Member**.`);
+    await interaction.message.edit({ components: [disabledButtons(uid, "👤 Member Added", ButtonStyle.Primary)] });
   }
 }
 // ════════════════════════════════════════════════════════════
