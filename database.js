@@ -1,6 +1,6 @@
 // ============================================================
 // DATABASE — SQLite via better-sqlite3
-// Tables: members, scan_log, pending_commands
+// FIXED: unixepoch() compatibility, stats fields
 // ============================================================
 const Database = require("better-sqlite3");
 const path = require("path");
@@ -12,6 +12,9 @@ const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
+// Helper for Unix timestamp (compatible with older SQLite)
+const nowUnix = () => Math.floor(Date.now() / 1000);
+
 // ── Schema ───────────────────────────────────────────────────
 db.exec(`
   CREATE TABLE IF NOT EXISTS members (
@@ -19,7 +22,7 @@ db.exec(`
     name      TEXT    NOT NULL,
     uid       TEXT    NOT NULL UNIQUE,
     role      TEXT    NOT NULL DEFAULT 'pending',
-    added_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    added_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     added_by  TEXT    NOT NULL DEFAULT 'system'
   );
 
@@ -28,7 +31,7 @@ db.exec(`
     uid       TEXT    NOT NULL,
     name      TEXT    NOT NULL DEFAULT 'Unknown',
     result    TEXT    NOT NULL,
-    scanned_at INTEGER NOT NULL DEFAULT (unixepoch())
+    scanned_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
   );
 
   CREATE TABLE IF NOT EXISTS day_grants (
@@ -49,7 +52,7 @@ db.exec(`
     name      TEXT    NOT NULL DEFAULT '',
     role      TEXT    NOT NULL DEFAULT '',
     count     INTEGER NOT NULL DEFAULT 10,
-    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     acked     INTEGER NOT NULL DEFAULT 0
   );
 `);
@@ -101,11 +104,9 @@ seedMembers();
 // MEMBER QUERIES
 // ════════════════════════════════════════════════════════════
 
-/** Find a member by UID. Returns row or undefined. */
 const getMember = (uid) =>
   db.prepare("SELECT * FROM members WHERE uid = ?").get(uid);
 
-/** All members with an approved role (not banned/pending). */
 const getApprovedMembers = () =>
   db
     .prepare(
@@ -113,15 +114,12 @@ const getApprovedMembers = () =>
     )
     .all();
 
-/** All pending members. */
 const getPendingMembers = () =>
   db.prepare("SELECT * FROM members WHERE role = 'pending' ORDER BY added_at DESC").all();
 
-/** All members (full list). */
 const getAllMembers = () =>
   db.prepare("SELECT * FROM members ORDER BY name COLLATE NOCASE").all();
 
-/** Update or insert a member. */
 const upsertMember = (uid, name, role, addedBy = "bot") => {
   db.prepare(`
     INSERT INTO members (uid, name, role, added_by)
@@ -130,7 +128,6 @@ const upsertMember = (uid, name, role, addedBy = "bot") => {
   `).run(uid, name, role, addedBy);
 };
 
-/** Change only the role of an existing member. Returns true if found. */
 const updateRole = (uid, newRole) => {
   const result = db
     .prepare("UPDATE members SET role = ? WHERE uid = ?")
@@ -145,7 +142,6 @@ const updateRole = (uid, newRole) => {
 const logScan = (uid, name, result) =>
   db.prepare("INSERT INTO scan_log (uid, name, result) VALUES (?, ?, ?)").run(uid, name, result);
 
-/** Most recent N scan log entries. */
 const getRecentLog = (n = 10) =>
   db
     .prepare(
@@ -153,7 +149,7 @@ const getRecentLog = (n = 10) =>
     )
     .all(n);
 
-/** Full stats. */
+// FIXED: Added missing stats fields
 const getStats = () =>
   db
     .prepare(`
@@ -162,20 +158,24 @@ const getStats = () =>
         SUM(result LIKE 'GRANTED%')                      AS granted,
         SUM(result LIKE 'DENIED%')                       AS denied,
         SUM(result = 'BANNED')                           AS banned,
-        SUM(result = 'NOT_IN_LIST')                      AS unknown
+        SUM(result = 'NOT_IN_LIST')                      AS unknown,
+        SUM(result = 'GRANTED_ONCE')                     AS once,
+        SUM(result = 'GRANTED_REMOTE')                   AS remote,
+        SUM(result = 'GRANTED_LEADER_DAY')               AS day_grants
       FROM scan_log
     `)
     .get();
 
 // ════════════════════════════════════════════════════════════
-// DAY GRANTS
+// DAY GRANTS (FIXED: uses UTC consistently)
 // ════════════════════════════════════════════════════════════
 
-/** Returns the day-of-year integer for today (UTC). */
 const todayDOY = () => {
   const now = new Date();
-  const start = new Date(now.getFullYear(), 0, 0);
-  return Math.floor((now - start) / 86400000);
+  // Use UTC to avoid timezone issues
+  const start = new Date(Date.UTC(now.getUTCFullYear(), 0, 0));
+  const diff = now.getTime() - start.getTime();
+  return Math.floor(diff / 86400000);
 };
 
 const isGrantedToday = (uid) => {
@@ -194,10 +194,9 @@ const grantDay = (uid) => {
 };
 
 // ════════════════════════════════════════════════════════════
-// PENDING COMMANDS (ESP32 polls these)
+// PENDING COMMANDS
 // ════════════════════════════════════════════════════════════
 
-/** Queue a command for the ESP32 to pick up. */
 const pushCommand = (id, action, uid = "", name = "", role = "", count = 10) => {
   db.prepare(`
     INSERT OR IGNORE INTO pending_commands (id, action, uid, name, role, count)
@@ -205,47 +204,40 @@ const pushCommand = (id, action, uid = "", name = "", role = "", count = 10) => 
   `).run(id, action, uid, name, role, count);
 };
 
-/** All un-acked commands (ESP32 fetches these). */
 const getPendingCommands = () =>
   db
     .prepare("SELECT * FROM pending_commands WHERE acked = 0 ORDER BY created_at ASC")
     .all();
 
-/** Mark a command as acknowledged. */
 const ackCommand = (id) =>
   db.prepare("UPDATE pending_commands SET acked = 1 WHERE id = ?").run(id);
 
 // ════════════════════════════════════════════════════════════
-// CLEANUP — delete acked commands older than 24h
+// CLEANUP
 // ════════════════════════════════════════════════════════════
 setInterval(() => {
   const deleted = db
     .prepare(
-      "DELETE FROM pending_commands WHERE acked = 1 AND created_at < unixepoch() - 86400"
+      "DELETE FROM pending_commands WHERE acked = 1 AND created_at < strftime('%s', 'now') - 86400"
     )
     .run();
   if (deleted.changes > 0)
     console.log(`[DB] Cleaned up ${deleted.changes} old commands`);
-}, 3600_000); // every hour
+}, 3600_000);
 
 // ════════════════════════════════════════════════════════════
-// SETTINGS (persistent key-value store)
+// SETTINGS
 // ════════════════════════════════════════════════════════════
 
-/** Save a setting value by key. */
 const saveSetting = (key, value) =>
   db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
 
-/** Get a setting value by key. Returns string or null. */
 const getSetting = (key) => {
   const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key);
   return row ? row.value : null;
 };
 
-/** Persist the Discord notification channel ID. */
 const saveChannelId = (channelId) => saveSetting("notify_channel_id", channelId);
-
-/** Retrieve the saved Discord notification channel ID. */
 const getChannelId = () => getSetting("notify_channel_id");
 
 module.exports = {

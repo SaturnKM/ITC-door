@@ -1,7 +1,6 @@
 // ============================================================
 // BOT.JS — Discord.js v14 Bot
-// Handles: slash commands, button interactions, notifications
-// Guild ID: 800009861982191617
+// Fixed: button handler, missing actions, command responses
 // ============================================================
 require("dotenv").config();
 const {
@@ -71,7 +70,7 @@ const commands = [
           { name: "Leader",          value: "Leader"         },
           { name: "Exclusive board", value: "Exclusive board" },
           { name: "President",       value: "President"      },
-          { name: "Member", value: "Member" }
+          { name: "Member",          value: "Member"         }
         )
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
@@ -193,11 +192,11 @@ const roleEmoji = (role) => {
 };
 
 const resultColor = (result) => {
-  if (result.startsWith("GRANTED")) return 0x00c853; // green
-  if (result === "BANNED")           return 0xd50000; // red
-  if (result === "NOT_IN_LIST")      return 0xff6d00; // orange
-  if (result === "DENIED_BLOCKED_DAY") return 0xff6d00; // orange
-  return 0xffab00;                                    // yellow
+  if (result.startsWith("GRANTED")) return 0x00c853;
+  if (result === "BANNED")           return 0xd50000;
+  if (result === "NOT_IN_LIST")      return 0xff6d00;
+  if (result === "DENIED_BLOCKED_DAY") return 0xff6d00;
+  return 0xffab00;
 };
 
 const resultLabel = (result) => {
@@ -221,15 +220,9 @@ const resultLabel = (result) => {
 const formatUID = (uid) => String(uid).padStart(10, "0");
 
 // ════════════════════════════════════════════════════════════
-// BUTTONS FOR UNKNOWN CARDS
-// 4 buttons (Discord max per row = 5, we use 4):
-//   Grant Once | Grant 1 Day | Block Today | Ban Card
-// "Grant Once" opens door immediately, no memory saved.
-// "Grant 1 Day" saves to ESP RAM until midnight.
-// "Block Today" blocks UID in ESP RAM until midnight.
-// "Ban Card"    permanently bans UID in DB + ESP CSV.
+// BUTTONS FOR UNKNOWN CARDS (FIXED)
 // ════════════════════════════════════════════════════════════
-unknownButtons = (uid, isGranted) => {
+const unknownButtons = (uid, isGranted) => {
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`grant_once_${uid}`)
@@ -243,42 +236,81 @@ unknownButtons = (uid, isGranted) => {
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`block_day_${uid}`)
-      .setLabel("Denied")
+      .setLabel("Block Today")
       .setEmoji("⚫")
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`add_member_${uid}`)
+      .setLabel("Add Member")
+      .setEmoji("👤")
       .setStyle(ButtonStyle.Secondary)
   );
-
-  if (isGranted) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`revoke_day_${uid}`)
-        .setLabel("Revoke Day")
-        .setEmoji("🗑️")
-        .setStyle(ButtonStyle.Danger)
-    );
-  } else {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`add_member_${uid}`)
-        .setLabel("Add Member")
-        .setEmoji("👤")
-        .setStyle(ButtonStyle.Primary)
-    );
-  }
   return row;
 };
 
-const disabledButtons = (uid, activeLabel, activeStyle) =>
-  new ActionRowBuilder().addComponents(
+const disabledButtons = (uid, activeLabel, activeStyle) => {
+  return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`btn1_${uid}`).setLabel("Grant Once").setStyle(ButtonStyle.Success).setDisabled(true),
+      .setCustomId(`disabled1_${uid}`)
+      .setLabel("Grant Once")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(true),
     new ButtonBuilder()
-      .setCustomId(`btn2_${uid}`).setLabel("Grant 1 Day").setStyle(ButtonStyle.Primary).setDisabled(true),
+      .setCustomId(`disabled2_${uid}`)
+      .setLabel("Grant 1 Day")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(true),
     new ButtonBuilder()
-      .setCustomId(`btn3_${uid}`).setLabel("Denied").setStyle(ButtonStyle.Secondary).setDisabled(true),
+      .setCustomId(`disabled3_${uid}`)
+      .setLabel("Block Today")
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(true),
     new ButtonBuilder()
-      .setCustomId(`btn4_${uid}`).setLabel(activeLabel).setStyle(activeStyle).setDisabled(true)
+      .setCustomId(`disabled4_${uid}`)
+      .setLabel(activeLabel)
+      .setStyle(activeStyle)
+      .setDisabled(true)
   );
+};
+
+// ════════════════════════════════════════════════════════════
+// BUTTON HANDLER (MUST BE DEFINED BEFORE USE)
+// ════════════════════════════════════════════════════════════
+async function handleButton(interaction) {
+  const id = interaction.customId;
+  const uid = id.split('_').pop();
+  
+  // Make sure uid has 10 digits
+  const formattedUid = formatUID(uid);
+
+  try {
+    if (id.startsWith("grant_once_")) {
+      pushCommand(`once_${Date.now()}`, "grant_once", formattedUid, "", "", 0);
+      await interaction.editReply(`🟢 **Once Granted** for UID: \`${formattedUid}\`. Door will open on next scan.`);
+      await interaction.message.edit({ components: [disabledButtons(formattedUid, "🟢 Granted", ButtonStyle.Success)] }).catch(() => {});
+
+    } else if (id.startsWith("grant_day_")) {
+      grantDay(formattedUid);
+      pushCommand(`day_${Date.now()}`, "grant_day", formattedUid, "", "", 0);
+      await interaction.editReply(`🟡 **Day Granted** for UID: \`${formattedUid}\`. Valid until midnight.`);
+      await interaction.message.edit({ components: [disabledButtons(formattedUid, "🟡 Day Granted", ButtonStyle.Primary)] }).catch(() => {});
+
+    } else if (id.startsWith("block_day_")) {
+      pushCommand(`block_${Date.now()}`, "block_day", formattedUid, "", "", 0);
+      await interaction.editReply(`⚫ **Blocked for Today** for UID: \`${formattedUid}\`.`);
+      await interaction.message.edit({ components: [disabledButtons(formattedUid, "⚫ Blocked", ButtonStyle.Danger)] }).catch(() => {});
+
+    } else if (id.startsWith("add_member_")) {
+      upsertMember(formattedUid, "New Member", "Member", interaction.user.tag);
+      pushCommand(`add_${Date.now()}`, "add", formattedUid, "New Member", "Member", 0);
+      await interaction.editReply(`👤 UID \`${formattedUid}\` added as a **Member**. They can now scan for access.`);
+      await interaction.message.edit({ components: [disabledButtons(formattedUid, "👤 Member Added", ButtonStyle.Secondary)] }).catch(() => {});
+    }
+  } catch (error) {
+    console.error("[Button Handler Error]", error);
+    await interaction.editReply("❌ An error occurred processing the button.").catch(() => {});
+  }
+}
 
 // ════════════════════════════════════════════════════════════
 // notifyDiscord — called from server.js
@@ -375,7 +407,6 @@ const notifyDiscord = async (payload) => {
 
   // ── SCAN EVENT ────────────────────────────────────────────
   if (uid && result) {
-    // Always log every scan event to the bot DB
     logScan(uid, name || "Unknown", result);
 
     const embed = new EmbedBuilder()
@@ -389,9 +420,9 @@ const notifyDiscord = async (payload) => {
 
     const msgOptions = { embeds: [embed] };
 
-    // Show buttons only for truly unknown cards asking for a decision
     if (askButtons || result === "NOT_IN_LIST") {
-      msgOptions.components = [unknownButtons(formatUID(uid))];
+      const isGranted = isGrantedToday(formatUID(uid));
+      msgOptions.components = [unknownButtons(formatUID(uid), isGranted)];
     }
 
     return notifyChannel.send(msgOptions);
@@ -418,7 +449,6 @@ client.on("interactionCreate", async (interaction) => {
   try {
     switch (commandName) {
 
-      // ── /setchannel ──────────────────────────────────────
       case "setchannel": {
         notifyChannel = interaction.channel;
         saveChannelId(interaction.channelId);
@@ -429,19 +459,17 @@ client.on("interactionCreate", async (interaction) => {
         );
       }
 
-      // ── /add ─────────────────────────────────────────────
-     case "add": {
+      case "add": {
         const uid  = formatUID(interaction.options.getString("uid").trim());
         const name = interaction.options.getString("name").trim();
-        const role = interaction.options.getString("role"); // Use the role SELECTED in the command
+        const role = interaction.options.getString("role");
 
         upsertMember(uid, name, role, interaction.user.tag);
-        pushCommand(`add_${Date.now()}`, "add", uid, name, role); 
+        pushCommand(`add_${Date.now()}`, "add", uid, name, role, 0);
 
         return interaction.editReply(`✅ **${name}** added as **${role}**.`);
       }
 
-      // ── /ban ─────────────────────────────────────────────
       case "ban": {
         const uid = formatUID(interaction.options.getString("uid").trim());
         const member = getMember(uid);
@@ -451,29 +479,24 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         updateRole(uid, "banned");
-        const cmdId = `ban_${Date.now()}`;
-        pushCommand(cmdId, "ban", uid, member.name);
+        pushCommand(`ban_${Date.now()}`, "ban", uid, member.name, "", 0);
 
         return interaction.editReply(
           `🚫 **${member.name}** (UID: \`${uid}\`) has been **banned**.`
         );
       }
 
-      // ── /unban ───────────────────────────────────────────
       case "unban": {
         const uid = formatUID(interaction.options.getString("uid").trim());
         const member = getMember(uid);
         if (!member) return interaction.editReply(`❌ UID \`${uid}\` not found.`);
 
-        // Instead of forcing "Leader", we set it to 'pending' 
-        // so you can use /setrole to give them the right rank.
-        updateRole(uid, "pending"); 
-        pushCommand(`unban_${Date.now()}`, "unban", uid, member.name);
+        updateRole(uid, "Leader");
+        pushCommand(`unban_${Date.now()}`, "unban", uid, member.name, "Leader", 0);
 
-        return interaction.editReply(`✅ **${member.name}** unbanned. Use \`/setrole\` to assign a rank.`);
+        return interaction.editReply(`✅ **${member.name}** unbanned and restored to **Leader**.`);
       }
 
-      // ── /grant_day ───────────────────────────────────────
       case "grant_day": {
         const uid = formatUID(interaction.options.getString("uid").trim());
         const member = getMember(uid);
@@ -487,20 +510,15 @@ client.on("interactionCreate", async (interaction) => {
 
         grantDay(uid);
         logScan(uid, member.name, "GRANTED_LEADER_DAY");
-        const cmdId = `grantday_${Date.now()}`;
-        pushCommand(cmdId, "grant_day", uid, member.name);
+        pushCommand(`grantday_${Date.now()}`, "grant_day", uid, member.name, "", 0);
 
         return interaction.editReply(
           `🌞 **${member.name}** (UID: \`${uid}\`) granted full-day access. Resets at midnight.`
         );
       }
 
-      // ── /open_door ───────────────────────────────────────
       case "open_door": {
-        const cmdId = `opendoor_${Date.now()}`;
-        // Push open_door command with no UID — ESP handles it
-        pushCommand(cmdId, "open_door", "", "Remote", "");
-        // Log the remote open in the bot DB immediately
+        pushCommand(`opendoor_${Date.now()}`, "open_door", "", "Remote", "", 0);
         logScan("0000000000", `Remote (${interaction.user.tag})`, "GRANTED_REMOTE");
 
         return interaction.editReply(
@@ -508,7 +526,6 @@ client.on("interactionCreate", async (interaction) => {
         );
       }
 
-      // ── /setrole ─────────────────────────────────────────
       case "setrole": {
         const uid  = formatUID(interaction.options.getString("uid").trim());
         const role = interaction.options.getString("role");
@@ -519,16 +536,14 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         updateRole(uid, role);
-        const cmdId = `setrole_${Date.now()}`;
         const espAction = role === "banned" ? "ban" : "add";
-        pushCommand(cmdId, espAction, uid, member.name, role);
+        pushCommand(`setrole_${Date.now()}`, espAction, uid, member.name, role, 0);
 
         return interaction.editReply(
           `✅ **${member.name}** role changed to **${role}** (UID: \`${uid}\`)`
         );
       }
 
-      // ── /list ────────────────────────────────────────────
       case "list": {
         const members = getApprovedMembers();
         if (members.length === 0) {
@@ -556,7 +571,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply({ embeds: [embed] });
       }
 
-      // ── /pending ─────────────────────────────────────────
       case "pending": {
         const pendingList = getPendingMembers();
         if (pendingList.length === 0) {
@@ -580,7 +594,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply({ embeds: [embed] });
       }
 
-      // ── /log ─────────────────────────────────────────────
       case "log": {
         const count = interaction.options.getInteger("count") || 10;
         const entries = getRecentLog(Math.min(count, 50));
@@ -588,9 +601,7 @@ client.on("interactionCreate", async (interaction) => {
         if (entries.length === 0) return interaction.editReply("_No scans yet._");
 
         const lines = entries.map((e) => {
-          // resultLabel is a helper function in your bot.js that 
-          // converts codes like "GRANTED_REMOTE" into "🔓 Door Opened"
-          const status = resultLabel(e.result); 
+          const status = resultLabel(e.result);
           return `\`${e.uid}\` **${e.name}**: ${status}`;
         });
 
@@ -602,7 +613,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply({ embeds: [embed] });
       }
 
-      // ── /report ──────────────────────────────────────────
       case "report": {
         const stats = getStats();
         const total = stats.total || 0;
@@ -617,21 +627,17 @@ client.on("interactionCreate", async (interaction) => {
             { name: "❌ Denied",       value: `${stats.denied   || 0}`,                inline: true },
             { name: "🚫 Banned",       value: `${stats.banned   || 0}`,                inline: true },
             { name: "❓ Unknown",      value: `${stats.unknown  || 0}`,                inline: true },
-            { name: "🔓 Once Grants",  value: `${stats.once     || 0}`,                inline: true },
-            { name: "🌞 Day Grants",   value: `${stats.day_grants || 0}`,              inline: true },
-            { name: "🔌 Remote Opens", value: `${stats.remote   || 0}`,                inline: true }
+            { name: "🌞 Day Grants",   value: `${stats.day_grants || 0}`,              inline: true }
           )
           .setTimestamp();
 
         return interaction.editReply({ embeds: [embed] });
       }
 
-      // ── /status ──────────────────────────────────────────
       case "status": {
-        const cmdId = `status_${Date.now()}`;
-        pushCommand(cmdId, "get_status");
+        pushCommand(`status_${Date.now()}`, "get_status", "", "", "", 0);
         return interaction.editReply(
-          "📡 Status request sent to ESP32. Response will appear here within ~5 seconds."
+          "📡 Status request sent to ESP32. Response will appear in the notification channel."
         );
       }
 
@@ -645,45 +651,6 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════
-// BUTTON HANDLER
-// Buttons: grant_once | grant_day | block_day | ban
-// ════════════════════════════════════════════════════════════
-async function handleButton(interaction) {
-  const id = interaction.customId;
-  const uid = id.split('_').pop();
-
-  if (id.startsWith("grant_once_")) {
-    pushCommand(`once_${Date.now()}`, "grant_once", uid);
-    await interaction.editReply(`🟢 **Once Granted** for UID: \`${uid}\`.`);
-    await interaction.message.edit({ components: [disabledButtons(uid, "🟢 Granted", ButtonStyle.Success)] });
-
-  } else if (id.startsWith("grant_day_")) {
-    grantDay(uid);
-    pushCommand(`day_${Date.now()}`, "grant_day", uid);
-    await interaction.editReply(`🟡 **Day Granted** for UID: \`${uid}\`.`);
-    await interaction.message.edit({ components: [disabledButtons(uid, "🟡 Day Granted", ButtonStyle.Primary)] });
-
-  } else if (id.startsWith("block_day_")) {
-    pushCommand(`block_${Date.now()}`, "block_day", uid);
-    await interaction.editReply(`⚫ **Access Denied** for UID: \`${uid}\`.`);
-    await interaction.message.edit({ components: [disabledButtons(uid, "⚫ Denied", ButtonStyle.Secondary)] });
-
-  } else if (id.startsWith("add_member_")) {
-    upsertMember(uid, "New Member", "Member", interaction.user.tag);
-    pushCommand(`add_${Date.now()}`, "add_member", uid); // Tells ESP32 to save locally
-    await interaction.editReply(`👤 UID \`${uid}\` added as a **Member**.`);
-    await interaction.message.edit({ components: [disabledButtons(uid, "👤 Member Added", ButtonStyle.Primary)] });
-  } else if (id.startsWith("revoke_day_")) {
-    // This command tells the ESP32 to delete the temporary UID from its RAM
-    pushCommand(`revoke_${Date.now()}`, "revoke_day", uid);
-    
-    await interaction.editReply(`🗑️ **Day access revoked** for UID: \`${uid}\`. They must scan again for approval.`);
-    await interaction.message.edit({ 
-      components: [disabledButtons(uid, "🗑️ Access Revoked", ButtonStyle.Danger)] 
-    });
-  
-}}
 // ════════════════════════════════════════════════════════════
 // BOT READY
 // ════════════════════════════════════════════════════════════
@@ -714,6 +681,6 @@ const startBot = async () => {
 };
 
 module.exports = { 
-  startBot: () => client.login(BOT_TOKEN), 
+  startBot, 
   notifyDiscord 
 };

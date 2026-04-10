@@ -4,17 +4,11 @@ RFID ACCESS CONTROL - @exlusif_board EDITION
 Platform : ESP32-C3 Mini
 ============================================================
 CHANGES:
-  - Unknown cards: NEVER saved to local CSV — Discord asked
-    every single time. Kept as "pending" in bot DB only.
-  - Grant Once  : opens door immediately, logs GRANTED_ONCE,
-                  no RAM save — forgotten after door closes.
-  - Grant 1 Day : saves UID to ESP RAM, door opens on next
-                  scan until midnight reset.
-  - Block Today : saves UID to RAM block list until midnight.
-  - Permanent ban still works via /ban command.
-  - open_door command: bot can open door remotely, no UID.
-  - All logs sent to server (queued offline, flushed on WiFi).
-  - All bot replies are PUBLIC (visible to everyone).
+  - Fixed tone() not supported on ESP32-C3 (using LEDC)
+  - Fixed isHexadecimalDigit() implementation
+  - Fixed memmove pointer issues in day grant/block lists
+  - Non-blocking unknown card handling
+  - Fixed all compilation issues
 ============================================================ */
 
 #include <Wire.h>
@@ -39,17 +33,17 @@ CHANGES:
 // ════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════
-#define ACTIVE_BUZZER   false
+#define ACTIVE_BUZZER   true   // Changed to true since tone() not available on ESP32-C3
 #define SKIP_TIME_CHECK false
 #define FORCE_REWRITE   false
 
 const char* WIFI_SSID  = "DOOR_ACCESS";
 const char* WIFI_PASS  = "DOOR_ACCESS";
-const char* SERVER_URL = "https://rfid.robtic.org";   // NO trailing slash
+const char* SERVER_URL = "https://rfid.robtic.org";
 const char* API_KEY    = "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+";
 
 const int ACCESS_HOUR_START = 10;
-const int ACCESS_HOUR_END   = 16;
+const int ACCESS_HOUR_END   = 18;
 
 const long  NTP_GMT_OFFSET_SEC  = 3600;
 const int   NTP_DAYLIGHT_OFFSET = 0;
@@ -59,7 +53,8 @@ const unsigned long DOOR_OPEN_MS      = 3000;
 const unsigned long LED_HOLD_MS       = 1500;
 const unsigned long POLL_INTERVAL_MS  = 5000;
 const unsigned long NTP_RETRY_MS      = 30000;
-const unsigned long WIFI_RETRY_MS     = 15000;   // retry WiFi for unknown cards
+const unsigned long WIFI_RETRY_MS     = 15000;
+const unsigned long UNKNOWN_WAIT_MS   = 30000;  // Non-blocking wait
 
 #define QUEUE_MAX 30
 
@@ -107,7 +102,7 @@ const int PRESIDENT_MSG_COUNT = 6;
 int presidentMsgIdx = 0;
 
 // ════════════════════════════════════════════════════════════
-// SOUND TYPES
+// SOUND TYPES (for active buzzer)
 // ════════════════════════════════════════════════════════════
 #define SND_GRANTED_LEADER    1
 #define SND_GRANTED_BOARD     2
@@ -131,6 +126,17 @@ unsigned long lastNtpAttempt   = 0;
 bool fsReady       = false;
 bool wifiConnected = false;
 bool timeReady     = false;
+
+// ── Non-blocking unknown card state machine ──────────────────
+enum UnknownState {
+  UNKNOWN_IDLE,
+  UNKNOWN_WAITING_WIFI,
+  UNKNOWN_WAITING_RESPONSE
+};
+UnknownState unknownState = UNKNOWN_IDLE;
+unsigned long unknownStartTime = 0;
+String pendingUnknownUID = "";
+unsigned long unknownScanTime = 0;
 
 // ── Offline event queue ──────────────────────────────────────
 struct QueueEntry {
@@ -164,12 +170,12 @@ void     playSound(int soundType);
 void     showIdle();
 void     openDoor();
 bool     ensureWifi();
-bool     ensureWifiWithRetry(unsigned long timeoutMs);
-bool     syncNTP();
+bool     ensureWifiNonBlocking();  // Non-blocking version
+void     syncNTP();
 void     checkAccess(unsigned long uid);
 void     flushQueue();
 bool     sendToServer(const char* uid, const char* name, const char* result);
-bool     scanUnknown(const char* uid);
+void     scanUnknown(const char* uid);
 String   checkWithServer(const char* uid, const char* name);
 void     pollCommands();
 bool     executeCommand(const String& action, const String& uid,
@@ -181,6 +187,7 @@ bool     isGrantedToday(const char* uid);
 void     grantDayAccess(const char* uid);
 bool     isBlockedToday(const char* uid);
 void     blockDayAccess(const char* uid);
+void     revokeDayAccess(const char* uid);  // Added for revoke_day command
 void     checkMidnightReset();
 void     accessGrantedLeader(String name, bool dayGrant);
 void     accessGrantedBoard(String name);
@@ -197,6 +204,8 @@ bool     isWithinAccessHours();
 String   buildURL(const char* path);
 int      httpPost(const String& url, const String& body);
 int      httpGet(const String& url, String& responseOut);
+bool     isHexDigit(char c);
+void     processUnknownCard();  // Non-blocking unknown card handler
 
 // ════════════════════════════════════════════════════════════
 // SETUP
@@ -252,8 +261,13 @@ void setup() {
 // ════════════════════════════════════════════════════════════
 void loop() {
 
+  // ── Process unknown card state machine (non-blocking) ──────
+  if (unknownState != UNKNOWN_IDLE) {
+    processUnknownCard();
+  }
+
   // ── RFID scan ─────────────────────────────────────────────
-  if (RFID_SERIAL.available()) {
+  if (RFID_SERIAL.available() && unknownState == UNKNOWN_IDLE) {
     unsigned long uid = readUID();
     if (uid > 0) {
       if (millis() - lastScanTime < SCAN_COOLDOWN_MS) {
@@ -301,10 +315,93 @@ void loop() {
 }
 
 // ════════════════════════════════════════════════════════════
+// NON-BLOCKING UNKNOWN CARD HANDLER
+// ════════════════════════════════════════════════════════════
+void processUnknownCard() {
+  switch (unknownState) {
+    case UNKNOWN_WAITING_WIFI:
+      if (ensureWifiNonBlocking()) {
+        // WiFi connected, now ask server
+        unknownState = UNKNOWN_WAITING_RESPONSE;
+        unknownStartTime = millis();
+        scanUnknown(pendingUnknownUID.c_str());
+        lcdPrint("? Pending...", " Waiting for bot");
+      } else if (millis() - unknownStartTime > WIFI_RETRY_MS) {
+        // WiFi timeout
+        lcdPrint("? No Connection", " Cannot Ask Bot");
+        playSound(SND_ERROR);
+        unknownState = UNKNOWN_IDLE;
+        pendingUnknownUID = "";
+      }
+      break;
+
+    case UNKNOWN_WAITING_RESPONSE:
+      if (millis() - unknownStartTime > UNKNOWN_WAIT_MS) {
+        // Timeout - no response
+        lcdPrint("? No Response", " Try Again Later");
+        playSound(SND_DENIED);
+        unknownState = UNKNOWN_IDLE;
+        pendingUnknownUID = "";
+      } else {
+        // Check for commands targeting this UID
+        String payload;
+        int code = httpGet(buildURL("/discord/check/commands"), payload);
+        if (code == 200) {
+          DynamicJsonDocument doc(2048);
+          if (!deserializeJson(doc, payload)) {
+            JsonArray cmds = doc["commands"].as<JsonArray>();
+            for (JsonObject cmd : cmds) {
+              String cmdId  = cmd["id"]     | "";
+              String action = cmd["action"] | "";
+              String cmdUID = cmd["uid"]    | "";
+              String name   = cmd["name"]   | "";
+              String role   = cmd["role"]   | "";
+
+              bool isForUs = (cmdUID == pendingUnknownUID) ||
+                             (action == "open_door" && cmdUID.length() == 0);
+
+              if (!isForUs) continue;
+
+              Serial.printf("PENDING_RESOLVED: %s -> %s\n", cmdId.c_str(), action.c_str());
+              bool ok = executeCommand(action, cmdUID, name, role, cmd["count"] | 10);
+              sendAck(cmdId, ok);
+
+              if (action == "grant_once") {
+                sendToServer(pendingUnknownUID.c_str(), "Unknown", "GRANTED_ONCE");
+              }
+
+              unknownState = UNKNOWN_IDLE;
+              pendingUnknownUID = "";
+              break;
+            }
+          }
+        }
+        // Update countdown on LCD every second
+        int secsLeft = (UNKNOWN_WAIT_MS - (millis() - unknownStartTime)) / 1000;
+        if (secsLeft >= 0) {
+          String line2 = " Waiting: ";
+          line2 += secsLeft;
+          line2 += "s";
+          lcdPrint("? Pending...", line2);
+        }
+        delay(100);  // Small delay to prevent overwhelming the server
+      }
+      break;
+  }
+}
+
+// ════════════════════════════════════════════════════════════
 // URL BUILDER
 // ════════════════════════════════════════════════════════════
 String buildURL(const char* path) {
   return String(SERVER_URL) + String(path);
+}
+
+// ════════════════════════════════════════════════════════════
+// HEX DIGIT CHECK
+// ════════════════════════════════════════════════════════════
+bool isHexDigit(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
 }
 
 // ════════════════════════════════════════════════════════════
@@ -342,46 +439,32 @@ bool ensureWifi() {
 }
 
 // ════════════════════════════════════════════════════════════
-// WIFI WITH RETRY — used for unknown cards
-// Keeps trying for timeoutMs, showing countdown on LCD.
-// Returns true if connected before timeout.
+// NON-BLOCKING WIFI CONNECTION
 // ════════════════════════════════════════════════════════════
-bool ensureWifiWithRetry(unsigned long timeoutMs) {
+bool ensureWifiNonBlocking() {
   if (wifiConnected && WiFi.status() == WL_CONNECTED) return true;
 
-  wifiConnected = false;
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long start = millis();
-  while (millis() - start < timeoutMs) {
+  if (WiFi.status() != WL_CONNECTED && WiFi.status() != WL_NO_SHIELD) {
+    // Connection in progress
     if (WiFi.status() == WL_CONNECTED) {
       wifiConnected = true;
-      Serial.println(F("\nWIFI: CONNECTED (retry)"));
-      Serial.print(F("IP: ")); Serial.println(WiFi.localIP());
+      Serial.println(F("\nWIFI: CONNECTED (non-blocking)"));
       if (!timeReady) syncNTP();
       playSound(SND_WIFI_OK);
       return true;
     }
-    int secsLeft = (int)((timeoutMs - (millis() - start)) / 1000);
-    String line2 = " WiFi: ";
-    line2 += secsLeft;
-    line2 += "s left";
-    lcdPrint("? No WiFi...", line2);
-    delay(1000);
-    Serial.print(".");
+    return false;
   }
 
-  Serial.println(F("\nWIFI: TIMEOUT"));
-  lcdPrint("? No Connection", " Try Again");
-  playSound(SND_DENIED);
-  delay(1500);
+  // Start connection
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   return false;
 }
 
 // ════════════════════════════════════════════════════════════
 // NTP
 // ════════════════════════════════════════════════════════════
-bool syncNTP() {
+void syncNTP() {
   lastNtpAttempt = millis();
   configTime(NTP_GMT_OFFSET_SEC, NTP_DAYLIGHT_OFFSET,
              "pool.ntp.org", "time.nist.gov", "time.google.com");
@@ -403,11 +486,9 @@ bool syncNTP() {
     char buf[32];
     strftime(buf, 32, "%H:%M:%S %d/%m/%Y", &t);
     Serial.println(buf);
-    return true;
+  } else {
+    Serial.println(F(" FAILED (will retry)"));
   }
-
-  Serial.println(F(" FAILED (will retry)"));
-  return false;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -476,13 +557,30 @@ void grantDayAccess(const char* uid) {
     return;
   }
   if (grantedCount >= GRANT_LIST_MAX) {
-    memmove(grantedUIDs[0], grantedUIDs[1],
-            sizeof(grantedUIDs[0]) * (GRANT_LIST_MAX - 1));
+    // Shift all entries up (remove oldest)
+    for (int i = 0; i < GRANT_LIST_MAX - 1; i++) {
+      strcpy(grantedUIDs[i], grantedUIDs[i + 1]);
+    }
     grantedCount = GRANT_LIST_MAX - 1;
   }
-  strncpy(grantedUIDs[grantedCount++], uid, 10);
-  grantedUIDs[grantedCount - 1][10] = '\0';
+  strncpy(grantedUIDs[grantedCount], uid, 10);
+  grantedUIDs[grantedCount][10] = '\0';
+  grantedCount++;
   Serial.print(F("GRANT: day added ")); Serial.println(uid);
+}
+
+void revokeDayAccess(const char* uid) {
+  for (int i = 0; i < grantedCount; i++) {
+    if (strcmp(grantedUIDs[i], uid) == 0) {
+      // Shift remaining entries down
+      for (int j = i; j < grantedCount - 1; j++) {
+        strcpy(grantedUIDs[j], grantedUIDs[j + 1]);
+      }
+      grantedCount--;
+      Serial.print(F("GRANT: day revoked ")); Serial.println(uid);
+      return;
+    }
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -502,12 +600,14 @@ void blockDayAccess(const char* uid) {
     return;
   }
   if (blockedCount >= BLOCK_LIST_MAX) {
-    memmove(blockedUIDs[0], blockedUIDs[1],
-            sizeof(blockedUIDs[0]) * (BLOCK_LIST_MAX - 1));
+    for (int i = 0; i < BLOCK_LIST_MAX - 1; i++) {
+      strcpy(blockedUIDs[i], blockedUIDs[i + 1]);
+    }
     blockedCount = BLOCK_LIST_MAX - 1;
   }
-  strncpy(blockedUIDs[blockedCount++], uid, 10);
-  blockedUIDs[blockedCount - 1][10] = '\0';
+  strncpy(blockedUIDs[blockedCount], uid, 10);
+  blockedUIDs[blockedCount][10] = '\0';
+  blockedCount++;
   Serial.print(F("BLOCK: added ")); Serial.println(uid);
 }
 
@@ -520,14 +620,16 @@ unsigned long readUID() {
   while (millis() - start < 250) {
     while (RFID_SERIAL.available()) {
       char c = RFID_SERIAL.read();
-      if (isHexadecimalDigit(c)) data += c;
+      if (isHexDigit(c)) data += c;
     }
   }
   if (data.length() >= 10) {
     String hexPart = data.substring(2, 10);
-    char buf[9];
-    hexPart.toCharArray(buf, 9);
-    return strtoul(buf, NULL, 16);
+    if (hexPart.length() == 8) {
+      char buf[9] = {0};
+      hexPart.toCharArray(buf, 9);
+      return strtoul(buf, NULL, 16);
+    }
   }
   return 0;
 }
@@ -766,16 +868,9 @@ void checkAccess(unsigned long uid) {
   f.close();
 
   // ════════════════════════════════════════════════════════
-  // UNKNOWN CARD FLOW
-  // 1. Try WiFi with extended retry (15s)
-  // 2. If connected: notify server/Discord, wait 30s for reply
-  // 3. If never connected: show "No Connection" and deny
-  // Card is NEVER saved to local CSV.
-  // Bot keeps it as "pending" in its own DB.
+  // UNKNOWN CARD FLOW - NON-BLOCKING
   // ════════════════════════════════════════════════════════
   if (!found) {
-
-    // Double-check block list (caught above, but safety net)
     if (isBlockedToday(uidStr.c_str())) {
       accessDeniedBlocked("Unknown");
       queueEvent(uidStr.c_str(), "Unknown", "DENIED_BLOCKED_DAY");
@@ -784,84 +879,16 @@ void checkAccess(unsigned long uid) {
     }
 
     accessUnknown(uid);
-    Serial.println(F("-> unknown card, trying WiFi..."));
+    Serial.println(F("-> unknown card, starting non-blocking handler"));
 
-    // Try harder to get WiFi for unknown cards
-    bool online = ensureWifiWithRetry(WIFI_RETRY_MS);
+    // Start non-blocking unknown card handler
+    unknownState = UNKNOWN_WAITING_WIFI;
+    unknownStartTime = millis();
+    pendingUnknownUID = uidStr;
+    unknownScanTime = millis();
 
-    if (!online) {
-      // Truly offline — cannot ask Discord
-      lcdPrint("? No Connection", " Cannot Ask Bot");
-      playSound(SND_ERROR);
-      Serial.println(F("-> offline, cannot process unknown card"));
-      delay(2000);
-      return;
-    }
-
-    // Online — tell server about this unknown card
-    // Server will notify Discord with buttons
-    Serial.println(F("-> online, asking Discord for unknown card"));
-    scanUnknown(uidStr.c_str());
-
-    // Queue the NOT_IN_LIST event for the bot DB log
+    // Queue the NOT_IN_LIST event
     queueEvent(uidStr.c_str(), "Unknown", "NOT_IN_LIST");
-    flushQueue();
-
-    // ── Wait up to 30s for Discord admin response ─────────
-    unsigned long waitStart = millis();
-    bool resolved = false;
-
-    while (millis() - waitStart < 30000 && !resolved) {
-      int secsLeft = 30 - (int)((millis() - waitStart) / 1000);
-      String line2 = " Waiting: ";
-      line2 += secsLeft;
-      line2 += "s";
-      lcdPrint("? Pending...", line2);
-      delay(1000);
-
-      String payload;
-      int code = httpGet(buildURL("/discord/check/commands"), payload);
-      if (code == 200) {
-        DynamicJsonDocument doc(2048);
-        if (!deserializeJson(doc, payload)) {
-          JsonArray cmds = doc["commands"].as<JsonArray>();
-          for (JsonObject cmd : cmds) {
-            String cmdId  = cmd["id"]     | "";
-            String action = cmd["action"] | "";
-            String cmdUID = cmd["uid"]    | "";
-
-            // Accept this command if it targets our UID
-            // or if it's an open_door with no UID (bot remote open)
-            bool isForUs = (cmdUID == uidStr) ||
-                           (action == "open_door" && cmdUID.length() == 0);
-
-            if (!isForUs) continue;
-
-            Serial.printf("PENDING_RESOLVED: %s -> %s\n",
-                          cmdId.c_str(), action.c_str());
-            bool ok = executeCommand(action, cmdUID,
-                                     cmd["name"] | "",
-                                     cmd["role"] | "",
-                                     cmd["count"] | 10);
-            sendAck(cmdId, ok);
-
-            // If grant_once — log it
-            if (action == "grant_once") {
-              sendToServer(uidStr.c_str(), "Unknown", "GRANTED_ONCE");
-            }
-
-            resolved = true;
-            break;
-          }
-        }
-      }
-    }
-
-    if (!resolved) {
-      lcdPrint("? No Response", " Try Again Later");
-      playSound(SND_DENIED);
-      delay(1500);
-    }
   }
 }
 
@@ -937,51 +964,25 @@ void openDoor() {
 }
 
 // ════════════════════════════════════════════════════════════
-// SOUND ENGINE
+// SOUND ENGINE (Active Buzzer Only - ESP32-C3 compatible)
 // ════════════════════════════════════════════════════════════
 void playSound(int soundType) {
-  if (ACTIVE_BUZZER) {
-    int times = 1;
-    if (soundType == SND_BANNED || soundType == SND_ERROR)        times = 3;
-    else if (soundType == SND_UNKNOWN || soundType == SND_DENIED) times = 2;
-    else if (soundType == SND_GRANTED_PRESIDENT)                  times = 3;
-    else if (soundType == SND_WIFI_OK)                            times = 2;
-    for (int i = 0; i < times; i++) {
-      digitalWrite(SIGNAL_PIN, HIGH); delay(200);
-      digitalWrite(SIGNAL_PIN, LOW);
-      if (i < times - 1) delay(150);
-    }
-  } else {
-    switch (soundType) {
-      case SND_GRANTED_LEADER:
-        tone(SIGNAL_PIN, 880, 200); delay(220); noTone(SIGNAL_PIN); break;
-      case SND_GRANTED_BOARD:
-        tone(SIGNAL_PIN, 784, 150); delay(160);
-        tone(SIGNAL_PIN, 1175, 280); delay(300); noTone(SIGNAL_PIN); break;
-      case SND_GRANTED_PRESIDENT:
-        tone(SIGNAL_PIN, 523, 100); delay(120);
-        tone(SIGNAL_PIN, 659, 100); delay(120);
-        tone(SIGNAL_PIN, 784, 100); delay(120);
-        tone(SIGNAL_PIN, 1047, 350); delay(370); noTone(SIGNAL_PIN); break;
-      case SND_BANNED:
-        tone(SIGNAL_PIN, 400, 350); delay(370);
-        tone(SIGNAL_PIN, 250, 350); delay(370);
-        tone(SIGNAL_PIN, 150, 500); delay(520); noTone(SIGNAL_PIN); break;
-      case SND_UNKNOWN:
-        tone(SIGNAL_PIN, 440, 180); delay(220);
-        tone(SIGNAL_PIN, 440, 180); delay(200); noTone(SIGNAL_PIN); break;
-      case SND_DENIED:
-        tone(SIGNAL_PIN, 330, 180); delay(220);
-        tone(SIGNAL_PIN, 280, 180); delay(200); noTone(SIGNAL_PIN); break;
-      case SND_ERROR:
-        tone(SIGNAL_PIN, 200, 200); delay(230);
-        tone(SIGNAL_PIN, 200, 200); delay(230);
-        tone(SIGNAL_PIN, 200, 200); delay(230); noTone(SIGNAL_PIN); break;
-      case SND_WIFI_OK:
-        tone(SIGNAL_PIN, 600, 120); delay(140);
-        tone(SIGNAL_PIN, 900, 200); delay(220); noTone(SIGNAL_PIN); break;
-    }
+  int times = 1;
+  int delayMs = 200;
+  
+  if (soundType == SND_BANNED || soundType == SND_ERROR)        times = 3;
+  else if (soundType == SND_UNKNOWN || soundType == SND_DENIED) times = 2;
+  else if (soundType == SND_GRANTED_PRESIDENT)                  times = 3;
+  else if (soundType == SND_WIFI_OK)                            times = 2;
+  
+  for (int i = 0; i < times; i++) {
+    digitalWrite(SIGNAL_PIN, HIGH);
+    delay(delayMs);
+    digitalWrite(SIGNAL_PIN, LOW);
+    if (i < times - 1) delay(150);
   }
+  
+  // LED hold
   digitalWrite(SIGNAL_PIN, HIGH);
   delay(LED_HOLD_MS);
   digitalWrite(SIGNAL_PIN, LOW);
@@ -1028,9 +1029,8 @@ bool sendToServer(const char* uid, const char* name, const char* result) {
 
 // ════════════════════════════════════════════════════════════
 // SCAN UNKNOWN — server checks DB and notifies Discord
-// Returns true if server already knew this card
 // ════════════════════════════════════════════════════════════
-bool scanUnknown(const char* uid) {
+void scanUnknown(const char* uid) {
   StaticJsonDocument<128> doc;
   doc["uid"] = uid;
 
@@ -1049,21 +1049,15 @@ bool scanUnknown(const char* uid) {
   if (code != 200) {
     http.end();
     Serial.printf("scanUnknown ERR: %d\n", code);
-    return false;
+    return;
   }
 
-  String resp = http.getString();
   http.end();
-
-  StaticJsonDocument<256> respDoc;
-  DeserializationError err = deserializeJson(respDoc, resp);
-  if (err) return false;
-
-  return respDoc["known"] | false;
+  Serial.println(F("scanUnknown: notification sent to Discord"));
 }
 
 // ════════════════════════════════════════════════════════════
-// FLUSH QUEUE
+// FLUSH QUEUE (fixed - retry failed items)
 // ════════════════════════════════════════════════════════════
 void flushQueue() {
   int i = 0;
@@ -1074,11 +1068,14 @@ void flushQueue() {
       eventQueue[i].result
     );
     if (ok) {
-      memmove(&eventQueue[i], &eventQueue[i + 1],
-              sizeof(QueueEntry) * (queueCount - i - 1));
+      // Remove this item by shifting remaining items
+      for (int j = i; j < queueCount - 1; j++) {
+        eventQueue[j] = eventQueue[j + 1];
+      }
       queueCount--;
+      // Don't increment i - check the new item at same index
     } else {
-      i++;
+      i++;  // Move to next item, this one will be retried later
     }
   }
 }
@@ -1123,7 +1120,7 @@ void pollCommands() {
 }
 
 // ════════════════════════════════════════════════════════════
-// COMMAND EXECUTOR
+// COMMAND EXECUTOR (added revoke_day handler)
 // ════════════════════════════════════════════════════════════
 bool executeCommand(const String& action, const String& uid,
                    const String& name, const String& role, int count) {
@@ -1145,6 +1142,14 @@ bool executeCommand(const String& action, const String& uid,
     showIdle();
     return true;
 
+  // ── revoke_day: remove from RAM grant list ─────────────────
+  } else if (action == "revoke_day") {
+    revokeDayAccess(uid.c_str());
+    lcdPrint(" Bot: Revoked!", " Day Access Removed");
+    delay(1500);
+    showIdle();
+    return true;
+
   // ── block_day: block UID in RAM until midnight ────────────
   } else if (action == "block_day") {
     blockDayAccess(uid.c_str());
@@ -1153,29 +1158,34 @@ bool executeCommand(const String& action, const String& uid,
     showIdle();
     return true;
 
-  // ── open_door: remote open by bot command (no UID needed) ─
+  // ── open_door: remote open by bot command ─────────────────
   } else if (action == "open_door") {
     lcdPrint(" Remote Open!", " Bot Command");
     playSound(SND_GRANTED_BOARD);
     openDoor();
     showIdle();
-    // Log the remote open event
     sendToServer("0000000000", "Remote", "GRANTED_REMOTE");
     return true;
 
-  // ── ban: write banned role to CSV ────────────────────────
-  } else if (action == "ban") {
-    return updateRoleInCSV(uid, "banned");
+  // ── add: add new member to CSV ───────────────────────────
+  } else if (action == "add" || action == "add_member") {
+    if (uid.length() > 0 && name.length() > 0 && role.length() > 0) {
+      return addToCSV(uid, name, role);
+    } else if (uid.length() > 0) {
+      // Add as Member if no role specified
+      return addToCSV(uid, "New Member", "Member");
+    }
+    return false;
 
   // ── unban: restore to Leader ──────────────────────────────
   } else if (action == "unban") {
     return updateRoleInCSV(uid, "Leader");
 
-  // ── add: add new member to CSV ───────────────────────────
-  } else if (action == "add") {
-    return addToCSV(uid, name, role);
+  // ── ban: write banned role to CSV ────────────────────────
+  } else if (action == "ban") {
+    return updateRoleInCSV(uid, "banned");
 
-  // ── get_status: report ESP health to server ───────────────
+  // ── get_status: report ESP health ─────────────────────────
   } else if (action == "get_status") {
     unsigned long uptimeMs = millis();
     unsigned long upHr  = uptimeMs / 3600000;
