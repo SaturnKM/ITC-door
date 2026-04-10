@@ -620,7 +620,7 @@ async function handleButton(interaction) {
     const cmdId = `grantday_${Date.now()}`;
     pushCommand(cmdId, "grant_day", uid);
 
-    await interaction.editReply(`🌞 Full-day access granted for UID \`${uid}\`. They can now enter until midnight.`);
+    await interaction.editReply(`🌞 **${interaction.user.tag}** granted full-day access for UID \`${uid}\`. They can enter until midnight.`);
 
     try {
       await interaction.message.edit({
@@ -635,7 +635,7 @@ async function handleButton(interaction) {
     const cmdId = `approve_${Date.now()}`;
     pushCommand(cmdId, "add", uid, "Unknown", "Leader");
 
-    await interaction.editReply(`✅ UID \`${uid}\` approved as **Leader**. Use \`/setrole\` to set their name.`);
+    await interaction.editReply(`✅ **${interaction.user.tag}** approved UID \`${uid}\` as **Leader**. Use \`/setrole\` to update their name.`);
 
     try {
       await interaction.message.edit({
@@ -644,15 +644,12 @@ async function handleButton(interaction) {
     } catch {}
 
   // ── Block for Today ──────────────────────────────────────
-  // Sends a block_day command to ESP32 — ESP stores UID in
-  // a blocked list in RAM, cleared at midnight like day grants.
-  // Does NOT permanently save anything to DB or CSV.
   } else if (id.startsWith("block_day_")) {
     const uid = id.replace("block_day_", "");
     const cmdId = `blockday_${Date.now()}`;
     pushCommand(cmdId, "block_day", uid);
 
-    await interaction.editReply(`🚫 UID \`${uid}\` blocked for today. They will be asked again tomorrow.`);
+    await interaction.editReply(`🚫 **${interaction.user.tag}** blocked UID \`${uid}\` for today. Discord will be asked again tomorrow.`);
 
     try {
       await interaction.message.edit({
@@ -668,7 +665,7 @@ async function handleButton(interaction) {
     const cmdId = `ban_${Date.now()}`;
     pushCommand(cmdId, "ban", uid);
 
-    await interaction.editReply(`🚫 UID \`${uid}\` has been **permanently banned**.`);
+    await interaction.editReply(`🚫 **${interaction.user.tag}** permanently banned UID \`${uid}\`.`);
 
     try {
       await interaction.message.edit({
