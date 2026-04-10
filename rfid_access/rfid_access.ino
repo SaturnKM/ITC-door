@@ -208,7 +208,7 @@ void setup() {
 
   pinMode(RELAY, OUTPUT);
   pinMode(SIGNAL_PIN, OUTPUT);
-  digitalWrite(RELAY, HIGH);
+  digitalWrite(RELAY, LOW);
   digitalWrite(SIGNAL_PIN, LOW);
 
   Wire.begin(6, 7);
@@ -931,9 +931,9 @@ void accessDenied(String name, const char* reason) {
 }
 
 void openDoor() {
-  digitalWrite(RELAY, LOW);
-  delay(DOOR_OPEN_MS);
   digitalWrite(RELAY, HIGH);
+  delay(DOOR_OPEN_MS);
+  digitalWrite(RELAY, LOW);
 }
 
 // ════════════════════════════════════════════════════════════
