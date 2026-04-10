@@ -3,13 +3,18 @@
 RFID ACCESS CONTROL - @exlusif_board EDITION
 Platform : ESP32-C3 Mini
 ============================================================
-CHANGES vs previous version:
-  - Unknown cards: NEVER saved to DB/CSV — Discord asked
-    every single time, no memory between scans
-  - Grant 1 Day: saves to ESP RAM, door opens next scan
-  - Block Today: saves UID to RAM block list until midnight
-  - Permanent ban still works via ban button / /ban command
-  - All bot replies are now PUBLIC (visible to everyone)
+CHANGES:
+  - Unknown cards: NEVER saved to local CSV — Discord asked
+    every single time. Kept as "pending" in bot DB only.
+  - Grant Once  : opens door immediately, logs GRANTED_ONCE,
+                  no RAM save — forgotten after door closes.
+  - Grant 1 Day : saves UID to ESP RAM, door opens on next
+                  scan until midnight reset.
+  - Block Today : saves UID to RAM block list until midnight.
+  - Permanent ban still works via /ban command.
+  - open_door command: bot can open door remotely, no UID.
+  - All logs sent to server (queued offline, flushed on WiFi).
+  - All bot replies are PUBLIC (visible to everyone).
 ============================================================ */
 
 #include <Wire.h>
@@ -24,7 +29,7 @@ CHANGES vs previous version:
 // ════════════════════════════════════════════════════════════
 // PIN DEFINITIONS
 // ════════════════════════════════════════════════════════════
-#define RELAY       4
+#define RELAY       5
 #define SIGNAL_PIN  3
 
 #define RFID_SERIAL  Serial1
@@ -49,11 +54,12 @@ const int ACCESS_HOUR_END   = 16;
 const long  NTP_GMT_OFFSET_SEC  = 3600;
 const int   NTP_DAYLIGHT_OFFSET = 0;
 
-const unsigned long SCAN_COOLDOWN_MS = 8000;
-const unsigned long DOOR_OPEN_MS     = 3000;
-const unsigned long LED_HOLD_MS      = 1500;
-const unsigned long POLL_INTERVAL_MS = 5000;
-const unsigned long NTP_RETRY_MS     = 30000;
+const unsigned long SCAN_COOLDOWN_MS  = 8000;
+const unsigned long DOOR_OPEN_MS      = 3000;
+const unsigned long LED_HOLD_MS       = 1500;
+const unsigned long POLL_INTERVAL_MS  = 5000;
+const unsigned long NTP_RETRY_MS      = 30000;
+const unsigned long WIFI_RETRY_MS     = 15000;   // retry WiFi for unknown cards
 
 #define QUEUE_MAX 30
 
@@ -142,7 +148,6 @@ int  grantedCount = 0;
 int  grantedDay   = -1;
 
 // ── Day block list (RAM only, resets at midnight) ─────────────
-// UIDs where Discord chose "Block Today" — cleared at midnight
 #define BLOCK_LIST_MAX 20
 char blockedUIDs[BLOCK_LIST_MAX][11];
 int  blockedCount = 0;
@@ -159,6 +164,7 @@ void     playSound(int soundType);
 void     showIdle();
 void     openDoor();
 bool     ensureWifi();
+bool     ensureWifiWithRetry(unsigned long timeoutMs);
 bool     syncNTP();
 void     checkAccess(unsigned long uid);
 void     flushQueue();
@@ -302,7 +308,7 @@ String buildURL(const char* path) {
 }
 
 // ════════════════════════════════════════════════════════════
-// WIFI
+// WIFI — quick connect (used for known members)
 // ════════════════════════════════════════════════════════════
 bool ensureWifi() {
   if (wifiConnected && WiFi.status() == WL_CONNECTED) return true;
@@ -333,6 +339,43 @@ bool ensureWifi() {
   }
 
   return wifiConnected;
+}
+
+// ════════════════════════════════════════════════════════════
+// WIFI WITH RETRY — used for unknown cards
+// Keeps trying for timeoutMs, showing countdown on LCD.
+// Returns true if connected before timeout.
+// ════════════════════════════════════════════════════════════
+bool ensureWifiWithRetry(unsigned long timeoutMs) {
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) return true;
+
+  wifiConnected = false;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      Serial.println(F("\nWIFI: CONNECTED (retry)"));
+      Serial.print(F("IP: ")); Serial.println(WiFi.localIP());
+      if (!timeReady) syncNTP();
+      playSound(SND_WIFI_OK);
+      return true;
+    }
+    int secsLeft = (int)((timeoutMs - (millis() - start)) / 1000);
+    String line2 = " WiFi: ";
+    line2 += secsLeft;
+    line2 += "s left";
+    lcdPrint("? No WiFi...", line2);
+    delay(1000);
+    Serial.print(".");
+  }
+
+  Serial.println(F("\nWIFI: TIMEOUT"));
+  lcdPrint("? No Connection", " Try Again");
+  playSound(SND_DENIED);
+  delay(1500);
+  return false;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -397,7 +440,7 @@ bool isWithinAccessHours() {
 }
 
 // ════════════════════════════════════════════════════════════
-// MIDNIGHT RESET — clears grant and block lists at new day
+// MIDNIGHT RESET
 // ════════════════════════════════════════════════════════════
 void checkMidnightReset() {
   if (!timeReady) return;
@@ -439,7 +482,7 @@ void grantDayAccess(const char* uid) {
   }
   strncpy(grantedUIDs[grantedCount++], uid, 10);
   grantedUIDs[grantedCount - 1][10] = '\0';
-  Serial.print(F("GRANT: added ")); Serial.println(uid);
+  Serial.print(F("GRANT: day added ")); Serial.println(uid);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -535,9 +578,7 @@ int httpGet(const String& url, String& responseOut) {
 }
 
 // ════════════════════════════════════════════════════════════
-// CHECK WITH SERVER
-// Ask server for verdict on a known member.
-// Returns verdict string or "" on failure (local fallback).
+// CHECK WITH SERVER (known members — Leaders)
 // ════════════════════════════════════════════════════════════
 String checkWithServer(const char* uid, const char* name) {
   StaticJsonDocument<128> doc;
@@ -592,10 +633,6 @@ String checkWithServer(const char* uid, const char* name) {
 
 // ════════════════════════════════════════════════════════════
 // ACCESS CHECK
-// Flow:
-//   1. Check block list (unknown cards blocked today)
-//   2. Read CSV — Board/President: local. Leader: ask server.
-//   3. Not in CSV: check block list again, then ask Discord
 // ════════════════════════════════════════════════════════════
 void checkAccess(unsigned long uid) {
   String uidStr = padUID(uid);
@@ -728,10 +765,17 @@ void checkAccess(unsigned long uid) {
   }
   f.close();
 
-  // ── Unknown card ─────────────────────────────────────────
-  // Ask Discord EVERY TIME — no DB/CSV save, no memory.
-  // If blocked today, deny silently.
+  // ════════════════════════════════════════════════════════
+  // UNKNOWN CARD FLOW
+  // 1. Try WiFi with extended retry (15s)
+  // 2. If connected: notify server/Discord, wait 30s for reply
+  // 3. If never connected: show "No Connection" and deny
+  // Card is NEVER saved to local CSV.
+  // Bot keeps it as "pending" in its own DB.
+  // ════════════════════════════════════════════════════════
   if (!found) {
+
+    // Double-check block list (caught above, but safety net)
     if (isBlockedToday(uidStr.c_str())) {
       accessDeniedBlocked("Unknown");
       queueEvent(uidStr.c_str(), "Unknown", "DENIED_BLOCKED_DAY");
@@ -740,17 +784,83 @@ void checkAccess(unsigned long uid) {
     }
 
     accessUnknown(uid);
-    if (ensureWifi()) {
-      Serial.println(F("-> asking Discord for unknown card"));
-      bool serverKnows = scanUnknown(uidStr.c_str());
-      Serial.print(F("-> serverKnows=")); Serial.println(serverKnows);
-      if (!serverKnows) {
-        // Truly unknown — Discord was notified with buttons
-        queueEvent(uidStr.c_str(), "Unknown", "NOT_IN_LIST");
-        flushQueue();
+    Serial.println(F("-> unknown card, trying WiFi..."));
+
+    // Try harder to get WiFi for unknown cards
+    bool online = ensureWifiWithRetry(WIFI_RETRY_MS);
+
+    if (!online) {
+      // Truly offline — cannot ask Discord
+      lcdPrint("? No Connection", " Cannot Ask Bot");
+      playSound(SND_ERROR);
+      Serial.println(F("-> offline, cannot process unknown card"));
+      delay(2000);
+      return;
+    }
+
+    // Online — tell server about this unknown card
+    // Server will notify Discord with buttons
+    Serial.println(F("-> online, asking Discord for unknown card"));
+    scanUnknown(uidStr.c_str());
+
+    // Queue the NOT_IN_LIST event for the bot DB log
+    queueEvent(uidStr.c_str(), "Unknown", "NOT_IN_LIST");
+    flushQueue();
+
+    // ── Wait up to 30s for Discord admin response ─────────
+    unsigned long waitStart = millis();
+    bool resolved = false;
+
+    while (millis() - waitStart < 30000 && !resolved) {
+      int secsLeft = 30 - (int)((millis() - waitStart) / 1000);
+      String line2 = " Waiting: ";
+      line2 += secsLeft;
+      line2 += "s";
+      lcdPrint("? Pending...", line2);
+      delay(1000);
+
+      String payload;
+      int code = httpGet(buildURL("/discord/check/commands"), payload);
+      if (code == 200) {
+        DynamicJsonDocument doc(2048);
+        if (!deserializeJson(doc, payload)) {
+          JsonArray cmds = doc["commands"].as<JsonArray>();
+          for (JsonObject cmd : cmds) {
+            String cmdId  = cmd["id"]     | "";
+            String action = cmd["action"] | "";
+            String cmdUID = cmd["uid"]    | "";
+
+            // Accept this command if it targets our UID
+            // or if it's an open_door with no UID (bot remote open)
+            bool isForUs = (cmdUID == uidStr) ||
+                           (action == "open_door" && cmdUID.length() == 0);
+
+            if (!isForUs) continue;
+
+            Serial.printf("PENDING_RESOLVED: %s -> %s\n",
+                          cmdId.c_str(), action.c_str());
+            bool ok = executeCommand(action, cmdUID,
+                                     cmd["name"] | "",
+                                     cmd["role"] | "",
+                                     cmd["count"] | 10);
+            sendAck(cmdId, ok);
+
+            // If grant_once — log it
+            if (action == "grant_once") {
+              sendToServer(uidStr.c_str(), "Unknown", "GRANTED_ONCE");
+            }
+
+            resolved = true;
+            break;
+          }
+        }
       }
-    } else {
-      queueEvent(uidStr.c_str(), "Unknown", "NOT_IN_LIST");
+    }
+
+    if (!resolved) {
+      lcdPrint("? No Response", " Try Again Later");
+      playSound(SND_DENIED);
+      delay(1500);
     }
   }
 }
@@ -811,6 +921,8 @@ void accessDeniedBlocked(String name) {
 void accessUnknown(unsigned long uid) {
   lcdPrint("? Unknown Card", padUID(uid));
   playSound(SND_UNKNOWN);
+  delay(1000);
+  lcdPrint("? Connecting...", " Please wait");
 }
 
 void accessDenied(String name, const char* reason) {
@@ -894,7 +1006,7 @@ void queueEvent(const char* uid, const char* name, const char* result) {
 }
 
 // ════════════════════════════════════════════════════════════
-// SEND EVENT TO SERVER
+// SEND EVENT TO SERVER (single event, no queue)
 // ════════════════════════════════════════════════════════════
 bool sendToServer(const char* uid, const char* name, const char* result) {
   StaticJsonDocument<256> doc;
@@ -972,7 +1084,7 @@ void flushQueue() {
 }
 
 // ════════════════════════════════════════════════════════════
-// POLL COMMANDS
+// POLL COMMANDS (background, every 5s)
 // ════════════════════════════════════════════════════════════
 void pollCommands() {
   String payload;
@@ -1016,30 +1128,54 @@ void pollCommands() {
 bool executeCommand(const String& action, const String& uid,
                    const String& name, const String& role, int count) {
 
-  if (action == "ban") {
-    return updateRoleInCSV(uid, "banned");
+  // ── grant_once: open door now, no memory saved ────────────
+  if (action == "grant_once") {
+    lcdPrint(" Bot: Once!", " Opening...");
+    playSound(SND_GRANTED_LEADER);
+    openDoor();
+    showIdle();
+    return true;
 
-  } else if (action == "unban") {
-    return updateRoleInCSV(uid, "Leader");
-
-  } else if (action == "add") {
-    return addToCSV(uid, name, role);
-
+  // ── grant_day: save to RAM, valid until midnight ──────────
   } else if (action == "grant_day") {
     grantDayAccess(uid.c_str());
     lcdPrint(" Bot: Day Grant!", " Full Day Accs");
+    playSound(SND_GRANTED_LEADER);
     delay(1500);
     showIdle();
     return true;
 
+  // ── block_day: block UID in RAM until midnight ────────────
   } else if (action == "block_day") {
-    // Block this UID for today only — RAM, clears at midnight
     blockDayAccess(uid.c_str());
     lcdPrint(" Bot: Blocked!", " Until Midnight");
     delay(1500);
     showIdle();
     return true;
 
+  // ── open_door: remote open by bot command (no UID needed) ─
+  } else if (action == "open_door") {
+    lcdPrint(" Remote Open!", " Bot Command");
+    playSound(SND_GRANTED_BOARD);
+    openDoor();
+    showIdle();
+    // Log the remote open event
+    sendToServer("0000000000", "Remote", "GRANTED_REMOTE");
+    return true;
+
+  // ── ban: write banned role to CSV ────────────────────────
+  } else if (action == "ban") {
+    return updateRoleInCSV(uid, "banned");
+
+  // ── unban: restore to Leader ──────────────────────────────
+  } else if (action == "unban") {
+    return updateRoleInCSV(uid, "Leader");
+
+  // ── add: add new member to CSV ───────────────────────────
+  } else if (action == "add") {
+    return addToCSV(uid, name, role);
+
+  // ── get_status: report ESP health to server ───────────────
   } else if (action == "get_status") {
     unsigned long uptimeMs = millis();
     unsigned long upHr  = uptimeMs / 3600000;
@@ -1061,6 +1197,7 @@ bool executeCommand(const String& action, const String& uid,
     int code = httpPost(buildURL("/discord/check/status-reply"), body);
     return (code >= 200 && code < 300);
 
+  // ── get_report ────────────────────────────────────────────
   } else if (action == "get_report") {
     StaticJsonDocument<128> doc;
     doc["queue_count"] = queueCount;
