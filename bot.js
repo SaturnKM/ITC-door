@@ -478,20 +478,16 @@ client.on("interactionCreate", async (interaction) => {
         );
       }
 
-      case "ban": {
+      case "unban": {
         const uid = formatUID(interaction.options.getString("uid").trim());
         const member = getMember(uid);
+        if (!member) return interaction.editReply(`❌ UID \`${uid}\` not found.`);
 
-        if (!member) {
-          return interaction.editReply(`❌ UID \`${uid}\` not found in database.`);
-        }
+        updateRole(uid, "Leader");
+        // Pass the member's name so ESP can add back to CSV
+        pushCommand(`unban_${Date.now()}`, "unban", uid, member.name, "Leader", 0);
 
-        updateRole(uid, "banned");
-        pushCommand(`ban_${Date.now()}`, "ban", uid, member.name, "", 0);
-
-        return interaction.editReply(
-          `🚫 **${member.name}** (UID: \`${uid}\`) has been **banned**.`
-        );
+        return interaction.editReply(`✅ **${member.name}** unbanned and restored to **Leader**.`);
       }
 
       case "unban": {
