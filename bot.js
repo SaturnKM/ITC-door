@@ -117,8 +117,9 @@ const commands = [
         .setRequired(true)
         .addChoices(
           { name: "Leader",          value: "Leader"         },
-          { name: "Exclusive board", value: "Exclusive board" },
+          { name: "Exclusive board", value: "Exclusive board"},
           { name: "President",       value: "President"      },
+          { name: "Member",          value: "Member"         },
           { name: "Banned",          value: "banned"         }
         )
     )
@@ -185,6 +186,7 @@ const roleEmoji = (role) => {
     case "Leader":          return "🔑";
     case "banned":          return "🚫";
     case "pending":         return "⏳";
+    case "Member":           return "👤";
     default:                return "❓";
   }
 };
