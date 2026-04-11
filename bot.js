@@ -122,6 +122,9 @@ const commands = [
           { name: "Banned",          value: "banned"          }
         )
     )
+    .addStringOption((o) =>
+      o.setName("name").setDescription("Display name (optional, updates existing name)").setRequired(false)
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
