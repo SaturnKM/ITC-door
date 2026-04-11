@@ -1,592 +1,556 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  RFID Access Control — Discord Bot + ESP32 API Server
+//  RFID Access Control — Discord Bot MODULE
+//  Entry point: server.js  |  Exports: startBot(), notifyDiscord()
 // ─────────────────────────────────────────────────────────────────────────────
 
-require('dotenv').config({ path: './config.env' });
+require("dotenv").config();
 
 const {
   Client, GatewayIntentBits, REST, Routes,
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder
-} = require('discord.js');
-const express = require('express');
-const fs      = require('fs');
-const path    = require('path');
+  ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder,
+} = require("discord.js");
+
+const {
+  getMember,
+  upsertMember,
+  updateRole,
+  logScan,
+  getRecentLog,
+  getStats,
+  isGrantedToday,
+  grantDay,
+  revokeDay,
+  pushCommand,
+  getPendingMembers,
+  getApprovedMembers,
+  saveChannelId,
+  getChannelId,
+} = require("./database");
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const TOKEN      = process.env.BOT_TOKEN;
-const CLIENT_ID  = process.env.CLIENT_ID;
-const GUILD_ID   = process.env.GUILD_ID;
-const CHANNEL_ID = process.env.CHANNEL_ID;
-const API_KEY    = process.env.API_KEY;
-const PORT       = parseInt(process.env.PORT) || 3000;
+const TOKEN     = process.env.BOT_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID  = process.env.GUILD_ID;
 
-const MEMBERS_FILE = path.join(__dirname, 'members.json');
-const LOGS_FILE    = path.join(__dirname, 'logs.json');
-const MAX_LOGS     = 200;
+// Canonical role values stored in DB (must match ESP32 strcmp checks exactly)
+const VALID_ROLES = ["President", "ExclusiveBoard", "Leader", "Member"];
 
-// ─── Discord + Express init ───────────────────────────────────────────────────
+// Human-readable labels for Discord display
+const ROLE_LABELS = {
+  President:      "President",
+  ExclusiveBoard: "Exclusive Board",
+  Leader:         "Leader",
+  Member:         "Member",
+  banned:         "Banned",
+  pending:        "Pending",
+};
+const roleLabel = (r) => ROLE_LABELS[r] || r || "?";
+
+// ─── Discord client ───────────────────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const app    = express();
-app.use(express.json());
 
-// ─── In-memory state ─────────────────────────────────────────────────────────
-// members  : { [uid]: { uid, name, role, dayGrant, dayGrantDate } }
-// pendingScans: { [uid]: { ts, messageId } }
-// commandQueue: { [uid]: [{ cmd, data, ts }] }  ← consumed by ESP during 60s window
-// updateQueue : [{ type, uid, name, role, dayGrant, dayGrantDate }] ← polled by ESP
-// globalCmds  : [{ cmd, ts }]                   ← e.g. open_door without UID
-let members       = {};
-let pendingScans  = {};
-let commandQueue  = {};
-let updateQueue   = [];
-let globalCmds    = [];
-let scanLogs      = [];
-let espStatus     = { lastSeen: null, uptime: 0, memberCount: 0, rssi: 0, ip: '' };
-
-// ─── Persistence helpers ──────────────────────────────────────────────────────
-function saveMembers() {
-  fs.writeFileSync(MEMBERS_FILE, JSON.stringify(members, null, 2));
-}
-function saveLogs() {
-  fs.writeFileSync(LOGS_FILE, JSON.stringify(scanLogs.slice(-MAX_LOGS), null, 2));
-}
-function loadData() {
-  if (fs.existsSync(MEMBERS_FILE)) members  = JSON.parse(fs.readFileSync(MEMBERS_FILE));
-  if (fs.existsSync(LOGS_FILE))    scanLogs = JSON.parse(fs.readFileSync(LOGS_FILE));
+// ─── Helper: fetch notify channel ────────────────────────────────────────────
+async function getNotifyChannel() {
+  const id = getChannelId();
+  if (!id) return null;
+  return client.channels.fetch(id).catch(() => null);
 }
 
-function addLog(entry) {
-  entry.ts = new Date().toISOString();
-  scanLogs.unshift(entry);
-  if (scanLogs.length > MAX_LOGS) scanLogs.length = MAX_LOGS;
-  saveLogs();
-}
-
-// ─── Roles ───────────────────────────────────────────────────────────────────
-const VALID_ROLES = ['President', 'ExclusiveBoard', 'Leader', 'Member'];
-
-function today() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-}
-
-function queueEspUpdate(update) {
-  updateQueue.push({ ...update, ts: Date.now() });
-}
-
-// ─── Member helpers ───────────────────────────────────────────────────────────
-function getMember(uid) { return members[uid.toUpperCase()] || null; }
-
-function upsertMember(uid, fields) {
-  uid = uid.toUpperCase();
-  members[uid] = { uid, name: 'Unknown', role: 'pending', dayGrant: false, dayGrantDate: '', ...members[uid], ...fields };
-  saveMembers();
-  return members[uid];
-}
-
-function findByName(name) {
-  return Object.values(members).find(m => m.name.toLowerCase() === name.toLowerCase());
-}
-
-// ─── Discord embed + button builders ─────────────────────────────────────────
-function unknownEmbed(uid, name, role, reason) {
-  const title = role === 'banned' ? '🚫 Banned Card Scanned' : '❓ Unknown / Pending Card';
-  const color = role === 'banned' ? 0xff0000 : 0xffa500;
+// ─── Embed builders ───────────────────────────────────────────────────────────
+function unknownEmbed(uid, name, role, result) {
+  const isBanned = result === "BANNED" || role === "banned";
   return new EmbedBuilder()
-    .setTitle(title)
-    .setColor(color)
+    .setTitle(isBanned ? "🚫 Banned Card Scanned" : "❓ Unknown / Pending Card")
+    .setColor(isBanned ? 0xff0000 : 0xffa500)
     .addFields(
-      { name: 'UID',    value: uid,             inline: true },
-      { name: 'Name',   value: name || '—',     inline: true },
-      { name: 'Role',   value: role || 'Unknown', inline: true },
-      { name: 'Time',   value: new Date().toLocaleTimeString(), inline: true },
-      { name: 'Reason', value: reason || '—',   inline: true }
+      { name: "UID",    value: uid || "—",           inline: true },
+      { name: "Name",   value: name || "—",           inline: true },
+      { name: "Role",   value: roleLabel(role),        inline: true },
+      { name: "Time",   value: new Date().toLocaleTimeString("fr-DZ", { hour: "2-digit", minute: "2-digit" }), inline: true },
+      { name: "Result", value: result || "—",          inline: true },
     )
     .setTimestamp();
 }
 
+function accessEmbed(uid, name, role, result) {
+  const granted = result.startsWith("GRANTED");
+  const color   = granted ? 0x00cc44 : result === "BANNED" ? 0xff0000 : 0xff4444;
+  const icon    = granted ? "✅" : result === "BANNED" ? "🚫" : "❌";
+
+  const LABELS = {
+    GRANTED_LEADER:     "access granted (within hours)",
+    GRANTED_PRESIDENT:  "access granted (24/7)",
+    GRANTED_BOARD:      "access granted (24/7)",
+    GRANTED_ONCE:       "one-time access granted",
+    GRANTED_REMOTE:     "door opened remotely",
+    GRANTED_LEADER_DAY: "access granted (day grant)",
+    DENIED_HOURS:       "denied — outside access hours",
+    DENIED_BANNED:      "denied — banned",
+    DENIED_MANUAL:      "denied — manual",
+    BANNED:             "banned card scanned",
+    NOT_IN_LIST:        "unknown card scanned",
+  };
+  const label = LABELS[result] || result;
+
+  return new EmbedBuilder()
+    .setColor(color)
+    .setDescription(`${icon} **${name || uid}** *(${roleLabel(role)})* — ${label}`)
+    .setTimestamp();
+}
+
+// ─── Button row factory ───────────────────────────────────────────────────────
+// disabled: array of action IDs to disable. "add_member" is never disabled.
 function actionRows(uid, disabled = []) {
   const d = (id) => disabled.includes(id);
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`grant_day:${uid}`).setLabel('Grant 1 Day').setStyle(ButtonStyle.Success).setDisabled(d('grant_day')),
-    new ButtonBuilder().setCustomId(`access_once:${uid}`).setLabel('Access Once').setStyle(ButtonStyle.Primary).setDisabled(d('access_once')),
-    new ButtonBuilder().setCustomId(`add_member:${uid}`).setLabel('Add Member').setStyle(ButtonStyle.Secondary).setDisabled(false),
-    new ButtonBuilder().setCustomId(`deny:${uid}`).setLabel('Deny').setStyle(ButtonStyle.Danger).setDisabled(d('deny')),
-    new ButtonBuilder().setCustomId(`ban:${uid}`).setLabel('Ban').setStyle(ButtonStyle.Danger).setDisabled(d('ban'))
-  );
-  return [row1];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`grant_day:${uid}`).setLabel("Grant 1 Day")  .setStyle(ButtonStyle.Success)  .setDisabled(d("grant_day")),
+      new ButtonBuilder().setCustomId(`access_once:${uid}`).setLabel("Access Once").setStyle(ButtonStyle.Primary)  .setDisabled(d("access_once")),
+      new ButtonBuilder().setCustomId(`add_member:${uid}`).setLabel("Add Member")  .setStyle(ButtonStyle.Secondary).setDisabled(false),
+      new ButtonBuilder().setCustomId(`deny:${uid}`).setLabel("Deny")              .setStyle(ButtonStyle.Danger)   .setDisabled(d("deny")),
+      new ButtonBuilder().setCustomId(`ban:${uid}`).setLabel("Ban")                .setStyle(ButtonStyle.Danger)   .setDisabled(d("ban")),
+    ),
+  ];
 }
 
-function allDisabledRows(uid) {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`grant_day:${uid}`).setLabel('Grant 1 Day').setStyle(ButtonStyle.Success).setDisabled(true),
-    new ButtonBuilder().setCustomId(`access_once:${uid}`).setLabel('Access Once').setStyle(ButtonStyle.Primary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`add_member:${uid}`).setLabel('Add Member').setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`deny:${uid}`).setLabel('Deny').setStyle(ButtonStyle.Danger).setDisabled(true),
-    new ButtonBuilder().setCustomId(`ban:${uid}`).setLabel('Ban').setStyle(ButtonStyle.Danger).setDisabled(true)
-  )];
-}
+const ACCESS_TAKEN_DISABLE = ["grant_day", "access_once", "deny", "ban"];
 
-async function notifyAccess(uid, name, role, action, reason) {
-  const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-  if (!channel) return;
-  const color = action === 'granted' ? 0x00cc44 : action === 'denied' ? 0xff4444 : 0x888888;
-  const icon  = action === 'granted' ? '✅' : action === 'denied' ? '❌' : 'ℹ️';
-  const embed = new EmbedBuilder()
-    .setColor(color)
-    .setDescription(`${icon} **${name || uid}** *(${role})* — ${reason}`)
-    .setTimestamp();
-  await channel.send({ embeds: [embed] }).catch(console.error);
+// ─── notifyDiscord — called by server.js ─────────────────────────────────────
+async function notifyDiscord({ uid, name, result, askButtons = false, statusData, members, pending, log, reportData }) {
+  const channel = await getNotifyChannel();
+  if (!channel) {
+    console.warn("[Bot] No notify channel set. Use /setchannel in Discord.");
+    return;
+  }
+
+  // ── STATUS_REPLY ────────────────────────────────────────────────────────────
+  if (result === "STATUS_REPLY" && statusData) {
+    const embed = new EmbedBuilder()
+      .setTitle("🔌 ESP32 Status")
+      .setColor(0x0099ff)
+      .addFields(
+        { name: "IP",         value: statusData.ip        || "—", inline: true },
+        { name: "RSSI",       value: statusData.rssi != null ? `${statusData.rssi} dBm` : "—", inline: true },
+        { name: "Uptime",     value: statusData.uptime    || "—", inline: true },
+        { name: "Members",    value: String(statusData.memberCount ?? "—"), inline: true },
+        { name: "Free Heap",  value: statusData.freeHeap != null ? `${statusData.freeHeap} B` : "—", inline: true },
+        { name: "LCD",        value: statusData.lcd       || "—", inline: true },
+      )
+      .setTimestamp();
+    await channel.send({ embeds: [embed] }).catch(console.error);
+    return;
+  }
+
+  // ── LIST_REPLY ───────────────────────────────────────────────────────────────
+  if (result === "LIST_REPLY" && members) {
+    const lines = members.map(m => `\`${m.uid}\` **${m.name}** — ${roleLabel(m.role)}`).join("\n") || "No members.";
+    await channel.send({ embeds: [new EmbedBuilder().setTitle("📋 Members (ESP32)").setDescription(lines).setColor(0x0099ff)] }).catch(console.error);
+    return;
+  }
+
+  // ── PENDING_REPLY ────────────────────────────────────────────────────────────
+  if (result === "PENDING_REPLY" && pending) {
+    const lines = pending.map(p => `\`${p.uid}\` **${p.name || "?"}**`).join("\n") || "None.";
+    await channel.send({ embeds: [new EmbedBuilder().setTitle("⏳ Pending Cards").setDescription(lines).setColor(0xffa500)] }).catch(console.error);
+    return;
+  }
+
+  // ── LOG_REPLY ────────────────────────────────────────────────────────────────
+  if (result === "LOG_REPLY" && log) {
+    const lines = log.map(l => `\`${l.uid}\` **${l.name}** — ${l.result}`).join("\n") || "No logs.";
+    await channel.send({ embeds: [new EmbedBuilder().setTitle("📜 Recent Log").setDescription(lines).setColor(0x888888)] }).catch(console.error);
+    return;
+  }
+
+  // ── REPORT_REPLY ─────────────────────────────────────────────────────────────
+  if (result === "REPORT_REPLY") {
+    const stats = getStats();
+    const embed = new EmbedBuilder()
+      .setTitle("📊 Access Report")
+      .setColor(0x0099ff)
+      .addFields(
+        { name: "Total scans",  value: String(stats.total      ?? 0), inline: true },
+        { name: "Granted",      value: String(stats.granted    ?? 0), inline: true },
+        { name: "Denied",       value: String(stats.denied     ?? 0), inline: true },
+        { name: "Banned scans", value: String(stats.banned     ?? 0), inline: true },
+        { name: "Unknown",      value: String(stats.unknown    ?? 0), inline: true },
+        { name: "Day grants",   value: String(stats.day_grants ?? 0), inline: true },
+      )
+      .setTimestamp();
+    await channel.send({ embeds: [embed] }).catch(console.error);
+    return;
+  }
+
+  // ── NOT_IN_LIST / unknown card — show action buttons ─────────────────────────
+  if (result === "NOT_IN_LIST" || askButtons) {
+    const member = getMember(uid);
+    const embed  = unknownEmbed(uid, member?.name || name, member?.role || "pending", result);
+    await channel.send({ embeds: [embed], components: actionRows(uid) }).catch(console.error);
+    return;
+  }
+
+  // ── BANNED — silent embed, no buttons ────────────────────────────────────────
+  if (result === "BANNED" || result === "DENIED_BANNED") {
+    const member = getMember(uid);
+    await channel.send({ embeds: [accessEmbed(uid, member?.name || name, "banned", result)] }).catch(console.error);
+    return;
+  }
+
+  // ── All other GRANTED_* / DENIED_* ───────────────────────────────────────────
+  const member = getMember(uid);
+  await channel.send({ embeds: [accessEmbed(uid, member?.name || name, member?.role || "?", result)] }).catch(console.error);
 }
 
 // ─── Slash command definitions ────────────────────────────────────────────────
+const roleChoices = [
+  { name: "President",       value: "President"      },
+  { name: "Exclusive Board", value: "ExclusiveBoard" },
+  { name: "Leader",          value: "Leader"         },
+  { name: "Member",          value: "Member"         },
+];
+
 const commands = [
-  new SlashCommandBuilder().setName('add').setDescription('Add a new member')
-    .addStringOption(o => o.setName('uid').setDescription('Card UID').setRequired(true))
-    .addStringOption(o => o.setName('name').setDescription('Member name').setRequired(true))
-    .addStringOption(o => o.setName('role').setDescription('Role').setRequired(true)
-      .addChoices(
-        { name: 'President',      value: 'President' },
-        { name: 'Exclusive Board',value: 'ExclusiveBoard' },
-        { name: 'Leader',         value: 'Leader' },
-        { name: 'Member',         value: 'Member' },
-      )),
+  new SlashCommandBuilder().setName("setchannel").setDescription("Set this channel for card scan alerts"),
 
-  new SlashCommandBuilder().setName('ban').setDescription('Ban a member')
-    .addStringOption(o => o.setName('uid').setDescription('Card UID').setRequired(true))
-    .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)),
+  new SlashCommandBuilder().setName("add").setDescription("Add a new member")
+    .addStringOption(o => o.setName("uid").setDescription("Card UID").setRequired(true))
+    .addStringOption(o => o.setName("name").setDescription("Member name").setRequired(true))
+    .addStringOption(o => o.setName("role").setDescription("Role").setRequired(true).addChoices(...roleChoices)),
 
-  new SlashCommandBuilder().setName('unban').setDescription('Unban — restores to Leader')
-    .addStringOption(o => o.setName('uid').setDescription('Card UID').setRequired(true)),
+  new SlashCommandBuilder().setName("ban").setDescription("Ban a member permanently")
+    .addStringOption(o => o.setName("uid").setDescription("Card UID").setRequired(true))
+    .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false)),
 
-  new SlashCommandBuilder().setName('grant_day').setDescription('Grant full-day access')
-    .addStringOption(o => o.setName('uid').setDescription('Card UID').setRequired(true)),
+  new SlashCommandBuilder().setName("unban").setDescription("Unban — restores to Leader")
+    .addStringOption(o => o.setName("uid").setDescription("Card UID").setRequired(true)),
 
-  new SlashCommandBuilder().setName('revoke_day').setDescription('Revoke day grant')
-    .addStringOption(o => o.setName('uid').setDescription('Card UID').setRequired(true)),
+  new SlashCommandBuilder().setName("grant_day").setDescription("Grant full-day access today")
+    .addStringOption(o => o.setName("uid").setDescription("Card UID").setRequired(true)),
 
-  new SlashCommandBuilder().setName('open_door').setDescription('Open door on demand'),
+  new SlashCommandBuilder().setName("revoke_day").setDescription("Revoke day grant")
+    .addStringOption(o => o.setName("uid").setDescription("Card UID").setRequired(true)),
 
-  new SlashCommandBuilder().setName('setrole').setDescription('Change member role')
-    .addStringOption(o => o.setName('uid').setDescription('Card UID').setRequired(true))
-    .addStringOption(o => o.setName('role').setDescription('New role').setRequired(true)
-      .addChoices(
-        { name: 'President',      value: 'President' },
-        { name: 'Exclusive Board',value: 'ExclusiveBoard' },
-        { name: 'Leader',         value: 'Leader' },
-        { name: 'Member',         value: 'Member' },
-      )),
+  new SlashCommandBuilder().setName("open_door").setDescription("Open door on demand"),
 
-  new SlashCommandBuilder().setName('rename').setDescription('Rename a member')
-    .addStringOption(o => o.setName('uid').setDescription('Card UID').setRequired(true))
-    .addStringOption(o => o.setName('name').setDescription('New name').setRequired(true)),
+  new SlashCommandBuilder().setName("setrole").setDescription("Change member role")
+    .addStringOption(o => o.setName("uid").setDescription("Card UID").setRequired(true))
+    .addStringOption(o => o.setName("role").setDescription("New role").setRequired(true).addChoices(...roleChoices)),
 
-  new SlashCommandBuilder().setName('list').setDescription('List approved members'),
-  new SlashCommandBuilder().setName('pending').setDescription('Show pending / unknown cards'),
-  new SlashCommandBuilder().setName('log').setDescription('Recent scan log')
-    .addIntegerOption(o => o.setName('count').setDescription('How many (default 10)').setRequired(false)),
-  new SlashCommandBuilder().setName('report').setDescription('Access statistics'),
-  new SlashCommandBuilder().setName('status').setDescription('ESP32 status'),
-  new SlashCommandBuilder().setName('help').setDescription('All commands explained'),
+  new SlashCommandBuilder().setName("rename").setDescription("Rename a member")
+    .addStringOption(o => o.setName("uid").setDescription("Card UID").setRequired(true))
+    .addStringOption(o => o.setName("name").setDescription("New name").setRequired(true)),
+
+  new SlashCommandBuilder().setName("list").setDescription("List approved members"),
+  new SlashCommandBuilder().setName("pending").setDescription("Show pending / unknown cards"),
+  new SlashCommandBuilder().setName("log").setDescription("Recent scan log")
+    .addIntegerOption(o => o.setName("count").setDescription("How many (default 10, max 25)").setRequired(false)),
+  new SlashCommandBuilder().setName("report").setDescription("Access statistics"),
+  new SlashCommandBuilder().setName("status").setDescription("Request ESP32 vitals"),
+  new SlashCommandBuilder().setName("help").setDescription("All commands explained"),
 ].map(c => c.toJSON());
 
-// ─── Register slash commands on ready ────────────────────────────────────────
-client.once('ready', async () => {
-  console.log(`✅ Bot ready: ${client.user.tag}`);
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  try {
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-    console.log('✅ Slash commands registered');
-  } catch (e) { console.error('Command registration failed:', e); }
-});
-
 // ─── Interaction handler ──────────────────────────────────────────────────────
-client.on('interactionCreate', async (interaction) => {
+client.on("interactionCreate", async (interaction) => {
 
-  // ── Slash commands ──────────────────────────────────────────────────────────
+  // ── Slash commands ─────────────────────────────────────────────────────────
   if (interaction.isChatInputCommand()) {
     await interaction.deferReply({ ephemeral: true }).catch(() => {});
     const cmd = interaction.commandName;
 
-    // ── /add ──────────────────────────────────────────────────────────────────
-    if (cmd === 'add') {
-      const uid  = interaction.options.getString('uid').toUpperCase();
-      const name = interaction.options.getString('name');
-      const role = interaction.options.getString('role');
-      upsertMember(uid, { name, role, dayGrant: false, dayGrantDate: '' });
-      queueEspUpdate({ type: 'add_member', uid, name, role, dayGrant: false, dayGrantDate: '' });
-      addLog({ uid, name, role, action: 'added', reason: `Added by admin` });
-      await interaction.editReply(`✅ Added **${name}** (${role}) — UID: \`${uid}\``);
+    // /setchannel
+    if (cmd === "setchannel") {
+      saveChannelId(interaction.channelId);
+      await interaction.editReply(`✅ Scan alerts will now be posted in <#${interaction.channelId}>`);
     }
 
-    // ── /ban ──────────────────────────────────────────────────────────────────
-    else if (cmd === 'ban') {
-      const uid    = interaction.options.getString('uid').toUpperCase();
-      const reason = interaction.options.getString('reason') || 'No reason';
+    // /add
+    else if (cmd === "add") {
+      const uid  = interaction.options.getString("uid").toUpperCase();
+      const name = interaction.options.getString("name").trim();
+      const role = interaction.options.getString("role");
+      upsertMember(uid, name, role, interaction.user.tag);
+      pushCommand(`add_${uid}_${Date.now()}`, "add_member", uid, name, role);
+      logScan(uid, name, `ADDED_${role.toUpperCase()}`);
+      await interaction.editReply(`✅ Added **${name}** as **${roleLabel(role)}** — UID: \`${uid}\``);
+    }
+
+    // /ban
+    else if (cmd === "ban") {
+      const uid    = interaction.options.getString("uid").toUpperCase();
+      const reason = interaction.options.getString("reason") || "No reason given";
       const m      = getMember(uid);
-      if (!m) return interaction.editReply('❌ UID not found.');
-      upsertMember(uid, { role: 'banned' });
-      queueEspUpdate({ type: 'update_member', uid, role: 'banned' });
-      addLog({ uid, name: m.name, role: 'banned', action: 'banned', reason });
-      await notifyAccess(uid, m.name, 'banned', 'denied', `Banned — ${reason}`);
-      await interaction.editReply(`🚫 Banned **${m.name}** (\`${uid}\`)`);
+      if (!m) return interaction.editReply("❌ UID not found in database.");
+      updateRole(uid, "banned");
+      pushCommand(`ban_${uid}_${Date.now()}`, "ban", uid, m.name, "banned");
+      logScan(uid, m.name, "BANNED");
+      await interaction.editReply(`🚫 Banned **${m.name}** (\`${uid}\`) — ${reason}`);
     }
 
-    // ── /unban ────────────────────────────────────────────────────────────────
-    else if (cmd === 'unban') {
-      const uid = interaction.options.getString('uid').toUpperCase();
+    // /unban
+    else if (cmd === "unban") {
+      const uid = interaction.options.getString("uid").toUpperCase();
       const m   = getMember(uid);
-      if (!m) return interaction.editReply('❌ UID not found.');
-      upsertMember(uid, { role: 'Leader' });
-      queueEspUpdate({ type: 'update_member', uid, role: 'Leader' });
-      addLog({ uid, name: m.name, role: 'Leader', action: 'unbanned', reason: 'Restored to Leader' });
+      if (!m) return interaction.editReply("❌ UID not found in database.");
+      updateRole(uid, "Leader");
+      pushCommand(`unban_${uid}_${Date.now()}`, "update_member", uid, m.name, "Leader");
       await interaction.editReply(`✅ Unbanned **${m.name}** — restored to Leader`);
     }
 
-    // ── /grant_day ────────────────────────────────────────────────────────────
-    else if (cmd === 'grant_day') {
-      const uid = interaction.options.getString('uid').toUpperCase();
+    // /grant_day
+    else if (cmd === "grant_day") {
+      const uid = interaction.options.getString("uid").toUpperCase();
       const m   = getMember(uid);
-      if (!m) return interaction.editReply('❌ UID not found.');
-      const d   = today();
-      upsertMember(uid, { dayGrant: true, dayGrantDate: d });
-      queueEspUpdate({ type: 'update_member', uid, dayGrant: true, dayGrantDate: d });
-      addLog({ uid, name: m.name, role: m.role, action: 'day_grant', reason: 'Granted by admin' });
-      await interaction.editReply(`✅ Day grant given to **${m.name}** for ${d}`);
+      if (!m) return interaction.editReply("❌ UID not found in database.");
+      grantDay(uid);
+      pushCommand(`grant_day_${uid}_${Date.now()}`, "grant_day", uid, m.name, m.role);
+      logScan(uid, m.name, "GRANTED_LEADER_DAY");
+      await interaction.editReply(`✅ Day grant given to **${m.name}** — valid until midnight`);
     }
 
-    // ── /revoke_day ───────────────────────────────────────────────────────────
-    else if (cmd === 'revoke_day') {
-      const uid = interaction.options.getString('uid').toUpperCase();
+    // /revoke_day
+    else if (cmd === "revoke_day") {
+      const uid = interaction.options.getString("uid").toUpperCase();
       const m   = getMember(uid);
-      if (!m) return interaction.editReply('❌ UID not found.');
-      upsertMember(uid, { dayGrant: false, dayGrantDate: '' });
-      queueEspUpdate({ type: 'update_member', uid, dayGrant: false, dayGrantDate: '' });
+      if (!m) return interaction.editReply("❌ UID not found in database.");
+      revokeDay(uid);                                         // ← actually remove from DB
+      pushCommand(`revoke_day_${uid}_${Date.now()}`, "revoke_day", uid, m.name, m.role);
       await interaction.editReply(`✅ Day grant revoked for **${m.name}**`);
     }
 
-    // ── /open_door ────────────────────────────────────────────────────────────
-    else if (cmd === 'open_door') {
-      globalCmds.push({ cmd: 'open_door', ts: Date.now() });
-      addLog({ uid: 'ADMIN', name: 'Admin', role: 'admin', action: 'open_door', reason: 'Manual open via /open_door' });
-      await interaction.editReply('🚪 Open door command queued for ESP32');
+    // /open_door
+    else if (cmd === "open_door") {
+      pushCommand(`open_door_${Date.now()}`, "open_door");
+      logScan("ADMIN", "Admin", "GRANTED_REMOTE");
+      await interaction.editReply("🚪 Door open command queued for ESP32 (valid for 60 s)");
     }
 
-    // ── /setrole ──────────────────────────────────────────────────────────────
-    else if (cmd === 'setrole') {
-      const uid  = interaction.options.getString('uid').toUpperCase();
-      const role = interaction.options.getString('role');
+    // /setrole
+    else if (cmd === "setrole") {
+      const uid  = interaction.options.getString("uid").toUpperCase();
+      const role = interaction.options.getString("role");
       const m    = getMember(uid);
-      if (!m) return interaction.editReply('❌ UID not found.');
-      upsertMember(uid, { role });
-      queueEspUpdate({ type: 'update_member', uid, role });
-      await interaction.editReply(`✅ **${m.name}** role changed to ${role}`);
+      if (!m) return interaction.editReply("❌ UID not found in database.");
+      updateRole(uid, role);
+      pushCommand(`setrole_${uid}_${Date.now()}`, "update_member", uid, m.name, role);
+      await interaction.editReply(`✅ **${m.name}** role changed to **${roleLabel(role)}**`);
     }
 
-    // ── /rename ───────────────────────────────────────────────────────────────
-    else if (cmd === 'rename') {
-      const uid  = interaction.options.getString('uid').toUpperCase();
-      const name = interaction.options.getString('name');
+    // /rename
+    else if (cmd === "rename") {
+      const uid  = interaction.options.getString("uid").toUpperCase();
+      const name = interaction.options.getString("name").trim();
       const m    = getMember(uid);
-      if (!m) return interaction.editReply('❌ UID not found.');
-      upsertMember(uid, { name });
-      queueEspUpdate({ type: 'update_member', uid, name });
-      await interaction.editReply(`✅ Renamed to **${name}**`);
+      if (!m) return interaction.editReply("❌ UID not found in database.");
+      upsertMember(uid, name, m.role, interaction.user.tag);
+      pushCommand(`rename_${uid}_${Date.now()}`, "update_member", uid, name, m.role);
+      await interaction.editReply(`✅ Renamed to **${name}** (\`${uid}\`)`);
     }
 
-    // ── /list ─────────────────────────────────────────────────────────────────
-    else if (cmd === 'list') {
-      const list = Object.values(members).filter(m => !['pending','banned'].includes(m.role));
-      if (!list.length) return interaction.editReply('No approved members yet.');
-      const lines = list.map(m => `\`${m.uid}\` **${m.name}** — ${m.role}${m.dayGrant ? ' 🌞' : ''}`).join('\n');
-      const embed = new EmbedBuilder().setTitle('📋 Approved Members').setDescription(lines).setColor(0x0099ff);
+    // /list
+    else if (cmd === "list") {
+      const list = getApprovedMembers();
+      if (!list.length) return interaction.editReply("No approved members yet.");
+      const lines = list.map(m =>
+        `\`${m.uid}\` **${m.name}** — ${roleLabel(m.role)}${isGrantedToday(m.uid) ? " 🌞" : ""}`
+      ).join("\n");
+      const embed = new EmbedBuilder().setTitle("📋 Approved Members").setDescription(lines).setColor(0x0099ff);
       await interaction.editReply({ embeds: [embed] });
     }
 
-    // ── /pending ──────────────────────────────────────────────────────────────
-    else if (cmd === 'pending') {
-      const list = Object.values(members).filter(m => m.role === 'pending');
-      const unkn = Object.entries(pendingScans).filter(([uid]) => !members[uid]);
-      if (!list.length && !unkn.length) return interaction.editReply('No pending cards.');
-      const lines = [
-        ...list.map(m => `\`${m.uid}\` **${m.name}** — pending`),
-        ...unkn.map(([uid]) => `\`${uid}\` — Unknown (scanned recently)`)
-      ].join('\n');
-      const embed = new EmbedBuilder().setTitle('⏳ Pending Cards').setDescription(lines).setColor(0xffa500);
+    // /pending
+    else if (cmd === "pending") {
+      const list = getPendingMembers();
+      if (!list.length) return interaction.editReply("No pending cards.");
+      const lines = list.map(m => `\`${m.uid}\` **${m.name || "?"}** — pending since <t:${m.added_at}:R>`).join("\n");
+      const embed = new EmbedBuilder().setTitle("⏳ Pending Cards").setDescription(lines).setColor(0xffa500);
       await interaction.editReply({ embeds: [embed] });
     }
 
-    // ── /log ──────────────────────────────────────────────────────────────────
-    else if (cmd === 'log') {
-      const n = Math.min(interaction.options.getInteger('count') || 10, 25);
-      if (!scanLogs.length) return interaction.editReply('No logs yet.');
-      const lines = scanLogs.slice(0, n).map(l => {
-        const t = new Date(l.ts).toLocaleTimeString();
-        const icon = l.action === 'granted' ? '✅' : l.action === 'denied' ? '❌' : 'ℹ️';
-        return `${icon} \`${t}\` **${l.name || l.uid}** (${l.role}) — ${l.reason}`;
-      }).join('\n');
-      const embed = new EmbedBuilder().setTitle(`📜 Last ${n} Logs`).setDescription(lines).setColor(0x888888);
+    // /log
+    else if (cmd === "log") {
+      const n    = Math.min(interaction.options.getInteger("count") || 10, 25);
+      const logs = getRecentLog(n);
+      if (!logs.length) return interaction.editReply("No logs yet.");
+      const lines = logs.map(l => {
+        const icon = l.result.startsWith("GRANTED") ? "✅" : l.result === "BANNED" ? "🚫" : "❌";
+        return `${icon} <t:${l.scanned_at}:t> **${l.name}** (\`${l.uid}\`) — ${l.result}`;
+      }).join("\n");
+      const embed = new EmbedBuilder().setTitle(`📜 Last ${n} Scans`).setDescription(lines).setColor(0x888888);
       await interaction.editReply({ embeds: [embed] });
     }
 
-    // ── /report ───────────────────────────────────────────────────────────────
-    else if (cmd === 'report') {
-      const todayStr  = today();
-      const todayLogs = scanLogs.filter(l => l.ts && l.ts.startsWith(todayStr));
-      const granted   = todayLogs.filter(l => l.action === 'granted').length;
-      const denied    = todayLogs.filter(l => l.action === 'denied').length;
-      const totalM    = Object.values(members);
+    // /report
+    else if (cmd === "report") {
+      const stats = getStats();
       const embed = new EmbedBuilder()
-        .setTitle('📊 Access Report')
+        .setTitle("📊 Access Report")
         .setColor(0x0099ff)
         .addFields(
-          { name: 'Total members',    value: `${totalM.filter(m => !['pending','banned'].includes(m.role)).length}`, inline: true },
-          { name: 'Pending',          value: `${totalM.filter(m => m.role === 'pending').length}`,  inline: true },
-          { name: 'Banned',           value: `${totalM.filter(m => m.role === 'banned').length}`,   inline: true },
-          { name: 'Granted today',    value: `${granted}`,  inline: true },
-          { name: 'Denied today',     value: `${denied}`,   inline: true },
-          { name: 'Day grants active',value: `${totalM.filter(m => m.dayGrant && m.dayGrantDate === todayStr).length}`, inline: true },
+          { name: "Total scans",  value: String(stats.total      ?? 0), inline: true },
+          { name: "Granted",      value: String(stats.granted    ?? 0), inline: true },
+          { name: "Denied",       value: String(stats.denied     ?? 0), inline: true },
+          { name: "Banned scans", value: String(stats.banned     ?? 0), inline: true },
+          { name: "Unknown",      value: String(stats.unknown    ?? 0), inline: true },
+          { name: "Day grants",   value: String(stats.day_grants ?? 0), inline: true },
         )
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
     }
 
-    // ── /status ───────────────────────────────────────────────────────────────
-    else if (cmd === 'status') {
-      const seen = espStatus.lastSeen ? new Date(espStatus.lastSeen).toLocaleString() : 'Never';
-      const up   = espStatus.uptime ? `${Math.floor(espStatus.uptime / 3600)}h ${Math.floor((espStatus.uptime % 3600) / 60)}m` : '—';
-      const embed = new EmbedBuilder()
-        .setTitle('🔌 ESP32 Status')
-        .setColor(espStatus.lastSeen && Date.now() - espStatus.lastSeen < 120000 ? 0x00cc44 : 0xff4444)
-        .addFields(
-          { name: 'Last seen',    value: seen,                                  inline: true },
-          { name: 'IP',           value: espStatus.ip || '—',                   inline: true },
-          { name: 'RSSI',         value: espStatus.rssi ? `${espStatus.rssi} dBm` : '—', inline: true },
-          { name: 'Uptime',       value: up,                                    inline: true },
-          { name: 'Members (ESP)',value: `${espStatus.memberCount}`,             inline: true },
-          { name: 'Pending cmds', value: `${updateQueue.length + globalCmds.length}`, inline: true },
-        );
-      await interaction.editReply({ embeds: [embed] });
+    // /status
+    else if (cmd === "status") {
+      pushCommand(`status_${Date.now()}`, "get_status");
+      await interaction.editReply("📡 Status request sent to ESP32 — response will appear in the notify channel shortly.");
     }
 
-    // ── /help ─────────────────────────────────────────────────────────────────
-    else if (cmd === 'help') {
+    // /help
+    else if (cmd === "help") {
       const embed = new EmbedBuilder()
-        .setTitle('📖 Bot Commands')
+        .setTitle("📖 RFID Access Bot — Commands")
         .setColor(0x0099ff)
         .setDescription(
-          '`/add <uid> <name> <role>` — Add a new member\n' +
-          '`/ban <uid> [reason]` — Ban a member permanently\n' +
-          '`/unban <uid>` — Unban, restores to Leader\n' +
-          '`/grant_day <uid>` — Grant full-day access (resets midnight)\n' +
-          '`/revoke_day <uid>` — Revoke day grant\n' +
-          '`/open_door` — Open the door on demand\n' +
-          '`/setrole <uid> <role>` — Change member role\n' +
-          '`/rename <uid> <name>` — Rename a member\n' +
-          '`/list` — Show approved members\n' +
-          '`/pending` — Show pending/unknown cards\n' +
-          '`/log [count]` — Recent scan events\n' +
-          '`/report` — Access statistics\n' +
-          '`/status` — ESP32 vitals\n' +
-          '`/help` — This message\n\n' +
-          '**Roles:** President (24/7), ExclusiveBoard (24/7), Leader (10–16), Member (10–16)\n' +
-          '**Buttons (on unknown scan):** Grant 1 Day · Access Once · Add Member · Deny · Ban'
+          "**Setup**\n" +
+          "`/setchannel` — Set notification channel for this server\n\n" +
+          "**Members**\n" +
+          "`/add <uid> <name> <role>` — Add new member\n" +
+          "`/ban <uid> [reason]` — Ban permanently\n" +
+          "`/unban <uid>` — Unban, restore to Leader\n" +
+          "`/setrole <uid> <role>` — Change role\n" +
+          "`/rename <uid> <name>` — Rename member\n\n" +
+          "**Access**\n" +
+          "`/grant_day <uid>` — Grant full-day access (resets midnight)\n" +
+          "`/revoke_day <uid>` — Remove day grant\n" +
+          "`/open_door` — Open door now (60s window)\n\n" +
+          "**Info**\n" +
+          "`/list` — All approved members\n" +
+          "`/pending` — Unknown/pending cards\n" +
+          "`/log [count]` — Recent scans\n" +
+          "`/report` — Stats summary\n" +
+          "`/status` — ESP32 hardware vitals\n\n" +
+          "**Roles**\n" +
+          "🟣 President — 24/7 | 🔵 Exclusive Board — 24/7\n" +
+          "🟢 Leader — 10:00–16:00 | 🟡 Member — 10:00–16:00\n\n" +
+          "**Buttons (on unknown scan)**\n" +
+          "Grant 1 Day · Access Once · Add Member · Deny · Ban"
         );
       await interaction.editReply({ embeds: [embed] });
     }
   }
 
-  // ── Button interactions ─────────────────────────────────────────────────────
+  // ── Button interactions ────────────────────────────────────────────────────
   else if (interaction.isButton()) {
-    const [action, uid] = interaction.customId.split(':');
+    const colonIdx = interaction.customId.indexOf(":");
+    const action   = interaction.customId.slice(0, colonIdx);
+    const uid      = interaction.customId.slice(colonIdx + 1);
 
-    // ── grant_day button ─────────────────────────────────────────────────────
-    if (action === 'grant_day') {
+    // grant_day ───────────────────────────────────────────────────────────────
+    if (action === "grant_day") {
       await interaction.deferUpdate();
-      const d  = today();
-      const m  = getMember(uid);
-      const name = m?.name || uid;
-      upsertMember(uid, { role: m?.role || 'Member', dayGrant: true, dayGrantDate: d });
-      commandQueue[uid] = commandQueue[uid] || [];
-      commandQueue[uid].push({ cmd: 'grant_day', data: { dayGrant: true, dayGrantDate: d }, ts: Date.now() });
-      queueEspUpdate({ type: 'update_member', uid, name, role: m?.role || 'Member', dayGrant: true, dayGrantDate: d });
-      addLog({ uid, name, role: m?.role || '?', action: 'day_grant', reason: 'Day grant via Discord button' });
-      const disabledButtons = ['grant_day', 'access_once', 'deny', 'ban'];
-      await interaction.message.edit({ components: actionRows(uid, disabledButtons) });
-      await notifyAccess(uid, name, m?.role || '?', 'granted', `Day grant — ${d}`);
+      const m = getMember(uid) || {};
+      grantDay(uid);
+      pushCommand(`grant_day_${uid}_${Date.now()}`, "grant_day", uid, m.name || uid, m.role || "Member");
+      logScan(uid, m.name || uid, "GRANTED_LEADER_DAY");
+      await interaction.message.edit({ components: actionRows(uid, ACCESS_TAKEN_DISABLE) });
+      const ch = await getNotifyChannel();
+      if (ch) await ch.send({ embeds: [accessEmbed(uid, m.name || uid, m.role, "GRANTED_LEADER_DAY")] }).catch(console.error);
     }
 
-    // ── access_once button ───────────────────────────────────────────────────
-    else if (action === 'access_once') {
+    // access_once ─────────────────────────────────────────────────────────────
+    else if (action === "access_once") {
       await interaction.deferUpdate();
-      const m    = getMember(uid);
-      const name = m?.name || uid;
-      commandQueue[uid] = commandQueue[uid] || [];
-      commandQueue[uid].push({ cmd: 'open_door', data: {}, ts: Date.now() });
-      addLog({ uid, name, role: m?.role || '?', action: 'access_once', reason: 'One-time access via Discord button' });
-      const disabledButtons = ['grant_day', 'access_once', 'deny', 'ban'];
-      await interaction.message.edit({ components: actionRows(uid, disabledButtons) });
-      await notifyAccess(uid, name, m?.role || 'Unknown', 'granted', 'One-time access granted');
+      const m = getMember(uid) || {};
+      pushCommand(`access_once_${uid}_${Date.now()}`, "open_door", uid, m.name || uid, m.role || "?");
+      logScan(uid, m.name || uid, "GRANTED_ONCE");
+      await interaction.message.edit({ components: actionRows(uid, ACCESS_TAKEN_DISABLE) });
+      const ch = await getNotifyChannel();
+      if (ch) await ch.send({ embeds: [accessEmbed(uid, m.name || uid, m.role, "GRANTED_ONCE")] }).catch(console.error);
     }
 
-    // ── add_member button ────────────────────────────────────────────────────
-    else if (action === 'add_member') {
-      const modal = new ModalBuilder()
-        .setCustomId(`modal_add:${uid}`)
-        .setTitle('Add Member');
-      const nameInput = new TextInputBuilder()
-        .setCustomId('name').setLabel('Name').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('John Doe');
-      const roleInput = new TextInputBuilder()
-        .setCustomId('role').setLabel('Role').setStyle(TextInputStyle.Short).setRequired(true)
-        .setPlaceholder('President / ExclusiveBoard / Leader / Member');
+    // add_member — show modal (does NOT disable other buttons) ────────────────
+    else if (action === "add_member") {
+      const modal = new ModalBuilder().setCustomId(`modal_add:${uid}`).setTitle("Add Member");
       modal.addComponents(
-        new ActionRowBuilder().addComponents(nameInput),
-        new ActionRowBuilder().addComponents(roleInput)
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId("name").setLabel("Full Name").setStyle(TextInputStyle.Short)
+            .setRequired(true).setPlaceholder("e.g. Amira Bensalem")
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId("role").setLabel("Role").setStyle(TextInputStyle.Short)
+            .setRequired(true).setPlaceholder("President / ExclusiveBoard / Leader / Member")
+        ),
       );
       await interaction.showModal(modal);
     }
 
-    // ── deny button ──────────────────────────────────────────────────────────
-    else if (action === 'deny') {
+    // deny ────────────────────────────────────────────────────────────────────
+    else if (action === "deny") {
       await interaction.deferUpdate();
-      const m    = getMember(uid);
-      const name = m?.name || uid;
-      commandQueue[uid] = commandQueue[uid] || [];
-      commandQueue[uid].push({ cmd: 'deny', data: {}, ts: Date.now() });
-      addLog({ uid, name, role: m?.role || '?', action: 'denied', reason: 'Denied via Discord button' });
-      const disabledButtons = ['grant_day', 'access_once', 'deny', 'ban'];
-      await interaction.message.edit({ components: actionRows(uid, disabledButtons) });
-      await notifyAccess(uid, name, m?.role || 'Unknown', 'denied', 'Denied via Discord');
+      const m = getMember(uid) || {};
+      pushCommand(`deny_${uid}_${Date.now()}`, "deny", uid, m.name || uid, m.role || "?");
+      logScan(uid, m.name || uid, "DENIED_MANUAL");
+      await interaction.message.edit({ components: actionRows(uid, ACCESS_TAKEN_DISABLE) });
+      const ch = await getNotifyChannel();
+      if (ch) await ch.send({ embeds: [accessEmbed(uid, m.name || uid, m.role, "DENIED_MANUAL")] }).catch(console.error);
     }
 
-    // ── ban button ───────────────────────────────────────────────────────────
-    else if (action === 'ban') {
+    // ban ─────────────────────────────────────────────────────────────────────
+    else if (action === "ban") {
       await interaction.deferUpdate();
-      const m    = getMember(uid);
-      const name = m?.name || uid;
-      upsertMember(uid, { role: 'banned' });
-      commandQueue[uid] = commandQueue[uid] || [];
-      commandQueue[uid].push({ cmd: 'ban', data: {}, ts: Date.now() });
-      queueEspUpdate({ type: 'update_member', uid, role: 'banned' });
-      addLog({ uid, name, role: 'banned', action: 'banned', reason: 'Banned via Discord button' });
-      await interaction.message.edit({ components: allDisabledRows(uid) });
-      await notifyAccess(uid, name, 'banned', 'denied', '🚫 Permanently banned');
+      const m = getMember(uid) || {};
+      upsertMember(uid, m.name || uid, "banned", "bot");
+      pushCommand(`ban_${uid}_${Date.now()}`, "ban", uid, m.name || uid, "banned");
+      logScan(uid, m.name || uid, "BANNED");
+      // Disable ALL action buttons
+      await interaction.message.edit({ components: actionRows(uid, ["grant_day", "access_once", "add_member", "deny", "ban"]) });
+      const ch = await getNotifyChannel();
+      if (ch) await ch.send({ embeds: [accessEmbed(uid, m.name || uid, "banned", "BANNED")] }).catch(console.error);
     }
   }
 
-  // ── Modal submission ────────────────────────────────────────────────────────
+  // ── Modal submissions ──────────────────────────────────────────────────────
   else if (interaction.isModalSubmit()) {
-    const [modalType, uid] = interaction.customId.split(':');
+    const colonIdx = interaction.customId.indexOf(":");
+    const modalType = interaction.customId.slice(0, colonIdx);
+    const uid       = interaction.customId.slice(colonIdx + 1);
 
-    if (modalType === 'modal_add') {
-      await interaction.deferReply({ ephemeral: true });
-      const name     = interaction.fields.getTextInputValue('name').trim();
-      const roleRaw  = interaction.fields.getTextInputValue('role').trim();
-      const roleMap  = { president:'President', exclusiveboard:'ExclusiveBoard', leader:'Leader', member:'Member' };
-      const role     = roleMap[roleRaw.toLowerCase().replace(/\s+/g,'')] || 'Member';
-      upsertMember(uid, { name, role, dayGrant: false, dayGrantDate: '' });
-      queueEspUpdate({ type: 'add_member', uid, name, role, dayGrant: false, dayGrantDate: '' });
-      addLog({ uid, name, role, action: 'added', reason: 'Added via Discord modal button' });
-      await interaction.editReply(`✅ Added **${name}** as **${role}** (UID: \`${uid}\`). Other action buttons are still active.`);
+    if (modalType === "modal_add") {
+      await interaction.deferReply({ ephemeral: true }).catch(() => {});
+      const name    = interaction.fields.getTextInputValue("name").trim();
+      const roleRaw = interaction.fields.getTextInputValue("role").trim();
+      const roleMap = {
+        president:      "President",
+        exclusiveboard: "ExclusiveBoard",
+        "exclusive board": "ExclusiveBoard",
+        leader:         "Leader",
+        member:         "Member",
+      };
+      const role = roleMap[roleRaw.toLowerCase().replace(/\s+/g, " ").trim()] || "Member";
+      upsertMember(uid, name, role, interaction.user.tag);
+      pushCommand(`add_${uid}_${Date.now()}`, "add_member", uid, name, role);
+      logScan(uid, name, `ADDED_${role.toUpperCase()}`);
+      await interaction.editReply(
+        `✅ Added **${name}** as **${roleLabel(role)}** (UID: \`${uid}\`)\n` +
+        `Other buttons (Grant Day / Access Once / Deny / Ban) are still active.`
+      );
     }
   }
 });
 
-// ─── Express API Middleware ───────────────────────────────────────────────────
-function authCheck(req, res, next) {
-  const key = req.headers['x-api-key'] || req.query.key;
-  if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  next();
+// ─── startBot — called by server.js ──────────────────────────────────────────
+async function startBot() {
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+  try {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    console.log("[Bot] Slash commands registered");
+  } catch (e) {
+    console.error("[Bot] Command registration failed:", e.message);
+  }
+  await client.login(TOKEN);
 }
-app.use('/api', authCheck);
 
-// ─── ESP32 API Routes ─────────────────────────────────────────────────────────
+client.once("ready", () => console.log(`[Bot] Ready as ${client.user.tag}`));
 
-// POST /api/scan — ESP reports a card scan (known, unknown, or banned)
-app.post('/api/scan', async (req, res) => {
-  const { uid, name, role, action, reason } = req.body;
-  if (!uid) return res.status(400).json({ error: 'uid required' });
-  const UID = uid.toUpperCase();
-
-  addLog({ uid: UID, name: name || UID, role: role || 'Unknown', action, reason });
-
-  // Unknown or pending → post Discord alert with buttons
-  if (!role || role === 'unknown' || role === 'pending') {
-    const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-    if (channel) {
-      const m = getMember(UID);
-      const embed = unknownEmbed(UID, m?.name || name || null, m?.role || role || 'Unknown', reason);
-      const msg   = await channel.send({ embeds: [embed], components: actionRows(UID) }).catch(console.error);
-      if (msg) pendingScans[UID] = { ts: Date.now(), messageId: msg.id };
-    }
-    return res.json({ queued: true });
-  }
-
-  // Banned → silent notify, no buttons
-  if (role === 'banned') {
-    await notifyAccess(UID, name, 'banned', 'denied', reason || 'Banned card scanned');
-    return res.json({ ok: true });
-  }
-
-  // Known member access log (granted / denied)
-  if (action === 'granted') {
-    await notifyAccess(UID, name, role, 'granted', reason || `${name} (${role}) entered at ${new Date().toLocaleTimeString()}`);
-  } else if (action === 'denied') {
-    await notifyAccess(UID, name, role, 'denied', reason || 'Denied');
-  }
-
-  res.json({ ok: true });
-});
-
-// GET /api/command/:uid — ESP polls during its 60s pending window
-app.get('/api/command/:uid', (req, res) => {
-  const uid  = req.params.uid.toUpperCase();
-  const cmds = commandQueue[uid];
-  if (!cmds || !cmds.length) return res.json({ command: null });
-  const cmd = cmds.shift();
-  if (!cmds.length) delete commandQueue[uid];
-  // Clean up pending scan tracking
-  if (pendingScans[uid]) delete pendingScans[uid];
-  res.json({ command: cmd.cmd, data: cmd.data });
-});
-
-// GET /api/updates — ESP polls regularly for member list changes + global cmds
-app.get('/api/updates', (req, res) => {
-  const updates = [...updateQueue];
-  const globals  = [...globalCmds];
-  updateQueue.length  = 0;
-  globalCmds.length   = 0;
-  res.json({ updates, globalCommands: globals });
-});
-
-// POST /api/status — ESP reports its vitals
-app.post('/api/status', (req, res) => {
-  const { uptime, rssi, memberCount, ip } = req.body;
-  espStatus = { lastSeen: Date.now(), uptime, rssi, memberCount, ip };
-  res.json({ ok: true, serverTime: Math.floor(Date.now() / 1000) });
-});
-
-// GET /api/members — ESP can request full member list on boot/resync
-app.get('/api/members', (req, res) => {
-  const list = Object.values(members).map(m => ({
-    uid: m.uid, name: m.name, role: m.role,
-    dayGrant: m.dayGrant, dayGrantDate: m.dayGrantDate || ''
-  }));
-  res.json({ members: list });
-});
-
-// ─── Start ────────────────────────────────────────────────────────────────────
-loadData();
-client.login(TOKEN);
-app.listen(PORT, () => console.log(`🌐 API server running on port ${PORT}`));
-
-// Clean up expired pending scans every minute
-setInterval(() => {
-  const now = Date.now();
-  for (const [uid, scan] of Object.entries(pendingScans)) {
-    if (now - scan.ts > 120000) delete pendingScans[uid];  // 2 min TTL
-  }
-  // Clean expired global commands (> 5 min old)
-  const idx = globalCmds.findIndex(c => now - c.ts > 300000);
-  if (idx !== -1) globalCmds.splice(0, idx + 1);
-}, 60000);
+module.exports = { startBot, notifyDiscord };
