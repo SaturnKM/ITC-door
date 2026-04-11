@@ -1,156 +1,193 @@
-# RFID Access Control System
+# RFID Door Access System — Setup Guide
 
-Discord bot + ESP32-C3 + RDM6300 RFID reader
+## System Overview
 
----
+```
+Discord ← bot.js → server.js (Express) ← ESP32-C3 Super Mini
+                         ↕
+                    SQLite (access.db)
+```
 
-## Hardware
-
-| Component        | Connection                          |
-|------------------|-------------------------------------|
-| RDM6300 TX       | ESP32-C3 GPIO 1 (UART1 RX)         |
-| RDM6300 VCC      | 5V                                  |
-| RDM6300 GND      | GND                                 |
-| LED Green (access granted) | GPIO 2 → 330Ω → GND     |
-| LED Red (access denied)    | GPIO 3 → 330Ω → GND     |
-| LED Yellow (scanning)      | GPIO 4 → 330Ω → GND     |
-| LED Green (WiFi state)     | GPIO 5 → 330Ω → GND     |
-| LED Red (error state)      | GPIO 10 → 330Ω → GND    |
-| Buzzer           | GPIO 6 → Buzzer+ (active LOW/HIGH) |
-| Door relay       | See openDoor() in .ino — add GPIO  |
+The ESP32 scans cards → asks the server → server checks DB → returns role.  
+The ESP32 decides access locally and posts the result back for Discord logging.  
+Unknown cards trigger Discord buttons; admins respond within 60 s.
 
 ---
 
-## Bot Setup
+## Hardware — ESP32-C3 Super Mini Pin Map
+
+| Component         | ESP32 Pin | Notes                                    |
+|-------------------|-----------|------------------------------------------|
+| RDM6300 TX        | GPIO 20   | UART1 RX — only this wire needed         |
+| RDM6300 VCC       | 5V        | Module needs 5 V                         |
+| RDM6300 GND       | GND       |                                          |
+| LCD SDA           | GPIO 8    | I²C SDA                                  |
+| LCD SCL           | GPIO 9    | I²C SCL                                  |
+| LCD VCC           | 3.3 V or 5 V | Check your backpack datasheet         |
+| LCD GND           | GND       |                                          |
+| Green LED (grant) | GPIO 5    | 220–330 Ω resistor to GND               |
+| Red   LED (deny)  | GPIO 6    | 220–330 Ω resistor to GND               |
+| Yellow LED (busy) | GPIO 7    | 220–330 Ω resistor to GND               |
+| Green LED (WiFi)  | GPIO 4    | 220–330 Ω resistor to GND               |
+| Red   LED (error) | GPIO 3    | 220–330 Ω resistor to GND               |
+| Buzzer            | GPIO 2    | Active buzzer or passive (5V tolerant)  |
+| Door relay IN     | GPIO 10   | Active-HIGH, 500 ms pulse               |
+
+> **LCD I²C address**: Most PCF8574 backpacks are `0x27`. Some are `0x3F`.  
+> Change `LCD_ADDR` in the sketch if the display stays blank.
+
+---
+
+## Server Setup
+
+### 1. Install dependencies
 
 ```bash
-cd access_bot
 npm install
 ```
 
-### config.env
-Fill in all fields:
+### 2. Create your env file
+
+Copy `config.env` → `.env` and fill in:
+
 ```
-BOT_TOKEN=        # From Discord Developer Portal
-CLIENT_ID=        # Application ID
-GUILD_ID=         # Your server ID (right-click server → Copy ID)
-CHANNEL_ID=       # Channel for scan alerts
+BOT_TOKEN=your_discord_bot_token
+CLIENT_ID=your_discord_application_id
+GUILD_ID=your_discord_server_id
 PORT=3000
-API_KEY=          # Any strong random string — must match ESP32 sketch
+API_KEY=your_secret_api_key   # must match API_KEY in the .ino sketch
 ```
 
-### Run
+### 3. Start the server
+
 ```bash
-node bot.js
+npm start
+# or with PM2 for production:
+pm2 start server.js --name rfid-bot
 ```
+
+### 4. Set the notification channel
+
+In Discord, run:
+```
+/setchannel
+```
+in the channel where you want scan alerts.
 
 ---
 
-## ESP32 Arduino IDE Setup
+## ESP32 Arduino Setup
 
-### Required libraries (Library Manager)
-- **ArduinoJson** by Benoit Blanchon
+### Libraries (install via Arduino Library Manager)
+- **ArduinoJson** by Benoit Blanchon (v7.x)
+- **LiquidCrystal I2C** by Frank de Brabander
+- **LittleFS** — comes with ESP32 board package (no install needed)
 
-### Built-in (ESP32 core)
-- LittleFS, WiFi, HTTPClient, time.h
+### Board settings (Arduino IDE)
+- Board: `ESP32C3 Dev Module`
+- Flash Size: `4MB (32Mb)`
+- Partition Scheme: `Default 4MB with spiffs` (or `No OTA`)
+- Upload Speed: `115200` or `921600`
 
-### Board settings
-- Board: `ESP32C3 Dev Module` (or `ESP32-C3 SuperMini`)
-- USB CDC On Boot: Enabled
-- Flash Size: 4MB
-- Partition Scheme: Default 4MB with spiffs (or Huge APP)
-
-### Edit in rfid_access.ino
+### Edit sketch before uploading
 ```cpp
-#define WIFI_SSID       "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
-#define SERVER_URL      "http://192.168.x.x:3000"  // Bot server LAN IP
-#define API_KEY         "same_key_as_config_env"
-#define TIMEZONE_STR    "CET-1CEST,M3.5.0,M10.5.0/3"  // Algeria
+#define WIFI_SSID       "your_wifi"
+#define WIFI_PASSWORD   "your_password"
+#define SERVER_URL      "https://your-server.com"
+#define API_KEY         "your_secret_api_key"
+#define LCD_ADDR        0x27   // change to 0x3F if blank
 ```
 
-Add your door relay to `openDoor()` function.
+---
+
+## Role Reference
+
+| Role           | Access hours | Requires WiFi for logging |
+|----------------|-------------|--------------------------|
+| President      | 24/7        | No (works offline)        |
+| ExclusiveBoard | 24/7        | No (works offline)        |
+| Leader         | 10:00–16:00 | Yes (for logging)         |
+| Member         | 10:00–16:00 | Yes (for logging)         |
+| pending        | None        | N/A — shows Discord buttons |
+| banned         | None        | Silent Discord notify      |
 
 ---
 
-## Role Logic
+## Discord Commands
 
-| Role           | Access Hours | WiFi Required | Notes                    |
-|----------------|-------------|---------------|--------------------------|
-| President      | 24/7        | No            | Always local             |
-| ExclusiveBoard | 24/7        | No            | Always local             |
-| Leader         | 10:00–16:00 | For logging   | Local time decision      |
-| Member         | 10:00–16:00 | For logging   | Same as Leader           |
-| pending        | Never       | Yes           | Shows Discord buttons    |
-| banned         | Never       | For notify    | Silent Discord notify    |
-| Unknown        | Never       | Yes           | Shows Discord buttons    |
-
-### Day Grant
-- Overrides time restriction — access all day
-- Resets automatically at midnight (ESP checks date on each scan)
-- Admin can revoke with `/revoke_day`
-
----
-
-## Discord Buttons (Unknown/Pending scan)
-
-| Button      | Effect                                          | Disables                        |
-|-------------|------------------------------------------------|---------------------------------|
-| Grant 1 Day | Access today, reset midnight                   | Itself, Access Once, Deny, Ban  |
-| Access Once | ESP opens door once (1 min pickup window)      | Itself, Grant 1 Day, Deny, Ban  |
-| Add Member  | Opens modal: name + role                       | Nothing (can still use others)  |
-| Deny        | Logs denial, notifies                          | Itself, Grant 1 Day, Access Once, Ban |
-| Ban         | Permanent ban, queues ESP update               | All buttons                     |
+| Command | Description |
+|---------|-------------|
+| `/setchannel` | Set notification channel |
+| `/add <uid> <name> <role>` | Add member |
+| `/ban <uid> [reason]` | Ban permanently |
+| `/unban <uid>` | Restore to Leader |
+| `/setrole <uid> <role>` | Change role |
+| `/rename <uid> <name>` | Rename member |
+| `/grant_day <uid>` | Full-day access (resets midnight) |
+| `/revoke_day <uid>` | Remove day grant |
+| `/open_door` | Open door now (60 s window) |
+| `/list` | Approved members |
+| `/pending` | Unknown/pending cards |
+| `/log [n]` | Last n scans (default 10) |
+| `/report` | Access statistics |
+| `/status` | ESP32 vitals |
+| `/help` | All commands |
 
 ---
 
-## Slash Commands
+## Discord Buttons (unknown card scan)
 
-| Command              | Description                              |
-|----------------------|------------------------------------------|
-| `/add uid name role` | Add member, sync to ESP                  |
-| `/ban uid [reason]`  | Ban permanently                          |
-| `/unban uid`         | Restore to Leader                        |
-| `/grant_day uid`     | Full-day access                          |
-| `/revoke_day uid`    | Remove day grant                         |
-| `/open_door`         | Open door on demand                      |
-| `/setrole uid role`  | Change role, sync to ESP                 |
-| `/rename uid name`   | Rename member                            |
-| `/list`              | Approved members                         |
-| `/pending`           | Pending/unknown cards                    |
-| `/log [count]`       | Recent scan events                       |
-| `/report`            | Stats for today                          |
-| `/status`            | ESP32 vitals                             |
-| `/help`              | All commands explained                   |
+| Button | Effect | Disables |
+|--------|--------|----------|
+| Grant 1 Day | Access today only, resets midnight | Grant 1 Day, Access Once, Deny, Ban |
+| Access Once | Opens door once (60 s ESP window) | Grant 1 Day, Access Once, Deny, Ban |
+| Add Member | Opens modal: enter name + role | Nothing (other buttons stay active) |
+| Deny | Logs denial, notifies | Grant 1 Day, Access Once, Deny, Ban |
+| Ban | Bans permanently | All buttons |
 
 ---
 
-## ESP32 ↔ Bot API
+## LCD Display States
 
-| Endpoint              | Method | Purpose                               |
-|-----------------------|--------|---------------------------------------|
-| `/api/scan`           | POST   | ESP reports card scan / unknown card  |
-| `/api/command/:uid`   | GET    | ESP polls for command (60s window)    |
-| `/api/updates`        | GET    | ESP polls for member changes (30s)    |
-| `/api/status`         | POST   | ESP reports vitals (60s)              |
-| `/api/members`        | GET    | ESP fetches full list on boot         |
-
-All requests require `x-api-key` header matching `API_KEY` in config.env.
+| State | Line 1 | Line 2 |
+|-------|--------|--------|
+| Idle | `Scan your card` | *(blank)* |
+| Scanning | `Scanning...` | UID |
+| Granted | Member name (scrolls if long) | Role + `>` |
+| Denied  | Member name | Role + `X` |
+| Waiting | `Waiting...` | `Check Discord` / countdown |
+| Boot | `RFID Access` | `Booting...` |
+| WiFi fail | `WiFi Failed` | `Offline mode` |
 
 ---
 
-## LED States
+## Troubleshooting
 
-| LED           | State           | Meaning                       |
-|---------------|-----------------|-------------------------------|
-| Yellow        | On / blinking   | Scanning / waiting for Discord|
-| Green (access)| On 2s then off  | Access granted                |
-| Red (access)  | On 2s then off  | Access denied                 |
-| Green (WiFi)  | Solid           | WiFi connected                |
-| Green (WiFi)  | Off             | No WiFi                       |
-| Red (error)   | Solid           | Error / problem               |
+**LCD blank after power-on**  
+→ Try changing `LCD_ADDR` to `0x3F` in the sketch.  
+→ Check I²C wiring (SDA=8, SCL=9).  
+→ Run an I²C scanner sketch to find the correct address.
 
-## Buzzer Patterns
-- **2 short beeps** — Access granted
-- **1 long beep** — Access denied
-- **3 short beeps** — Error
+**Cards not reading**  
+→ RDM6300 needs 5 V VCC — do not use 3.3 V.  
+→ Only connect the TX wire from the module to GPIO 20.
+
+**ESP32 always in offline mode**  
+→ Check WIFI_SSID/PASSWORD match exactly (case-sensitive).  
+→ ESP32-C3 is 2.4 GHz only — 5 GHz networks will not work.
+
+**Bot not responding to commands**  
+→ Ensure CLIENT_ID and GUILD_ID are correct in `.env`.  
+→ Bot needs `applications.commands` scope and `bot` scope when invited.
+
+**`/revoke_day` not working**  
+→ Updated `database.js` now properly deletes the day grant row.  
+Previous version only queued the command without removing the DB record.
+
+**Role mismatch between DB and ESP32**  
+→ DB stores `ExclusiveBoard` (one word, no space). The old seed used  
+`"Exclusive board"` which the ESP32 did not recognise. Reseed from  
+scratch or run:
+```sql
+UPDATE members SET role='ExclusiveBoard' WHERE role='Exclusive board';
+```
