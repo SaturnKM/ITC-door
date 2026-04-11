@@ -1,12 +1,11 @@
 // ============================================================
 // BOT.JS — Discord.js v14 Bot
-// Fixed: button handler, missing actions, command responses
 // ============================================================
-require("dotenv").config(); 
+require("dotenv").config();
 const {
   Client,
   GatewayIntentBits,
-  REST, 
+  REST,
   Routes,
   SlashCommandBuilder,
   EmbedBuilder,
@@ -67,10 +66,10 @@ const commands = [
         .setDescription("Role to assign")
         .setRequired(true)
         .addChoices(
-          { name: "Leader",          value: "Leader"         },
+          { name: "Leader",          value: "Leader"          },
           { name: "Exclusive board", value: "Exclusive board" },
-          { name: "President",       value: "President"      },
-          { name: "Member",          value: "Member"         }
+          { name: "President",       value: "President"       },
+          { name: "Member",          value: "Member"          }
         )
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
@@ -116,11 +115,11 @@ const commands = [
         .setDescription("New role")
         .setRequired(true)
         .addChoices(
-          { name: "Leader",          value: "Leader"         },
-          { name: "Exclusive board", value: "Exclusive board"},
-          { name: "President",       value: "President"      },
-          { name: "Member",          value: "Member"         },
-          { name: "Banned",          value: "banned"         }
+          { name: "Leader",          value: "Leader"          },
+          { name: "Exclusive board", value: "Exclusive board" },
+          { name: "President",       value: "President"       },
+          { name: "Member",          value: "Member"          },
+          { name: "Banned",          value: "banned"          }
         )
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
@@ -178,7 +177,6 @@ const registerCommands = async () => {
 // ════════════════════════════════════════════════════════════
 // HELPERS — Embeds & formatting
 // ════════════════════════════════════════════════════════════
-
 const roleEmoji = (role) => {
   switch (role) {
     case "President":       return "👑";
@@ -186,33 +184,33 @@ const roleEmoji = (role) => {
     case "Leader":          return "🔑";
     case "banned":          return "🚫";
     case "pending":         return "⏳";
-    case "Member":           return "👤";
+    case "Member":          return "👤";
     default:                return "❓";
   }
 };
 
 const resultColor = (result) => {
-  if (result.startsWith("GRANTED")) return 0x00c853;
-  if (result === "BANNED")           return 0xd50000;
-  if (result === "NOT_IN_LIST")      return 0xff6d00;
+  if (result.startsWith("GRANTED"))    return 0x00c853;
+  if (result === "BANNED")             return 0xd50000;
+  if (result === "NOT_IN_LIST")        return 0xff6d00;
   if (result === "DENIED_BLOCKED_DAY") return 0xff6d00;
   return 0xffab00;
 };
 
 const resultLabel = (result) => {
   const map = {
-    GRANTED_LEADER:       "✅ Access Granted (Leader)",
-    GRANTED_LEADER_DAY:   "✅ Access Granted (Full Day)",
-    GRANTED_BOARD:        "✅ Access Granted (Exclusive Board)",
-    GRANTED_PRESIDENT:    "✅ Access Granted (President 👑)",
-    GRANTED_ONCE:         "✅ Access Granted (Once — Unknown Card)",
-    GRANTED_REMOTE:       "🔓 Door Opened Remotely (Bot Command)",
-    DENIED_HOURS:         "⏰ Denied — Outside Hours",
-    DENIED_PENDING:       "⏳ Denied — Awaiting Approval",
-    DENIED_ROLE:          "❌ Denied — Invalid Role",
-    DENIED_BLOCKED_DAY:   "🚫 Denied — Blocked for Today",
-    BANNED:               "🚫 BANNED Card Attempted Entry",
-    NOT_IN_LIST:          "❓ Unknown Card Scanned",
+    GRANTED_LEADER:      "✅ Access Granted (Leader)",
+    GRANTED_LEADER_DAY:  "✅ Access Granted (Full Day)",
+    GRANTED_BOARD:       "✅ Access Granted (Exclusive Board)",
+    GRANTED_PRESIDENT:   "✅ Access Granted (President 👑)",
+    GRANTED_ONCE:        "✅ Access Granted (Once — Unknown Card)",
+    GRANTED_REMOTE:      "🔓 Door Opened Remotely (Bot Command)",
+    DENIED_HOURS:        "⏰ Denied — Outside Hours",
+    DENIED_PENDING:      "⏳ Denied — Awaiting Approval",
+    DENIED_ROLE:         "❌ Denied — Invalid Role",
+    DENIED_BLOCKED_DAY:  "🚫 Denied — Blocked for Today",
+    BANNED:              "🚫 BANNED Card Attempted Entry",
+    NOT_IN_LIST:         "❓ Unknown Card Scanned",
   };
   return map[result] || result;
 };
@@ -220,10 +218,10 @@ const resultLabel = (result) => {
 const formatUID = (uid) => String(uid).padStart(10, "0");
 
 // ════════════════════════════════════════════════════════════
-// BUTTONS FOR UNKNOWN CARDS (FIXED)
+// BUTTONS FOR UNKNOWN CARDS
 // ════════════════════════════════════════════════════════════
-const unknownButtons = (uid, isGranted) => {
-  const row = new ActionRowBuilder().addComponents(
+const unknownButtons = (uid) => {
+  return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`grant_once_${uid}`)
       .setLabel("Grant Once")
@@ -245,7 +243,6 @@ const unknownButtons = (uid, isGranted) => {
       .setEmoji("👤")
       .setStyle(ButtonStyle.Secondary)
   );
-  return row;
 };
 
 const disabledButtons = (uid, activeLabel, activeStyle) => {
@@ -274,13 +271,11 @@ const disabledButtons = (uid, activeLabel, activeStyle) => {
 };
 
 // ════════════════════════════════════════════════════════════
-// BUTTON HANDLER (MUST BE DEFINED BEFORE USE)
+// BUTTON HANDLER
 // ════════════════════════════════════════════════════════════
 async function handleButton(interaction) {
-  const id = interaction.customId;
-  const uid = id.split('_').pop();
-  
-  // Make sure uid has 10 digits
+  const id           = interaction.customId;
+  const uid          = id.split("_").pop();
   const formattedUid = formatUID(uid);
 
   try {
@@ -413,16 +408,15 @@ const notifyDiscord = async (payload) => {
       .setTitle(resultLabel(result))
       .setColor(resultColor(result))
       .addFields(
-        { name: "Name", value: name || "Unknown", inline: true },
-        { name: "UID",  value: `\`${formatUID(uid)}\``, inline: true }
+        { name: "Name", value: name || "Unknown",          inline: true },
+        { name: "UID",  value: `\`${formatUID(uid)}\``,   inline: true }
       )
       .setTimestamp();
 
     const msgOptions = { embeds: [embed] };
 
     if (askButtons || result === "NOT_IN_LIST") {
-      const isGranted = isGrantedToday(formatUID(uid));
-      msgOptions.components = [unknownButtons(formatUID(uid), isGranted)];
+      msgOptions.components = [unknownButtons(formatUID(uid))];
     }
 
     return notifyChannel.send(msgOptions);
@@ -459,39 +453,32 @@ client.on("interactionCreate", async (interaction) => {
         );
       }
 
-      case "setrole": {
+      case "add": {
         const uid  = formatUID(interaction.options.getString("uid").trim());
+        const name = interaction.options.getString("name").trim();
         const role = interaction.options.getString("role");
-        const member = getMember(uid);
 
-        if (!member) {
-          return interaction.editReply(`❌ UID \`${uid}\` not found in database.`);
-        }
-
-        updateRole(uid, role);
-        
-        // Send "setrole" action instead of ban/add
-        pushCommand(`setrole_${Date.now()}`, "setrole", uid, member.name, role, 0);
+        upsertMember(uid, name, role, interaction.user.tag);
+        pushCommand(`add_${Date.now()}`, "add", uid, name, role, 0);
 
         return interaction.editReply(
-          `✅ **${member.name}** role changed to **${role}** (UID: \`${uid}\`)`
+          `✅ **${name}** added as **${role}** (UID: \`${uid}\`)`
         );
       }
 
-      case "unban": {
-        const uid = formatUID(interaction.options.getString("uid").trim());
+      case "ban": {
+        const uid    = formatUID(interaction.options.getString("uid").trim());
         const member = getMember(uid);
         if (!member) return interaction.editReply(`❌ UID \`${uid}\` not found.`);
 
-        updateRole(uid, "Leader");
-        // Pass the member's name so ESP can add back to CSV
-        pushCommand(`unban_${Date.now()}`, "unban", uid, member.name, "Leader", 0);
+        updateRole(uid, "banned");
+        pushCommand(`ban_${Date.now()}`, "ban", uid, member.name, "banned", 0);
 
-        return interaction.editReply(`✅ **${member.name}** unbanned and restored to **Leader**.`);
+        return interaction.editReply(`🚫 **${member.name}** has been banned (UID: \`${uid}\`).`);
       }
 
       case "unban": {
-        const uid = formatUID(interaction.options.getString("uid").trim());
+        const uid    = formatUID(interaction.options.getString("uid").trim());
         const member = getMember(uid);
         if (!member) return interaction.editReply(`❌ UID \`${uid}\` not found.`);
 
@@ -502,15 +489,10 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       case "grant_day": {
-        const uid = formatUID(interaction.options.getString("uid").trim());
+        const uid    = formatUID(interaction.options.getString("uid").trim());
         const member = getMember(uid);
-
-        if (!member) {
-          return interaction.editReply(`❌ UID \`${uid}\` not found in database.`);
-        }
-        if (member.role === "banned") {
-          return interaction.editReply(`🚫 **${member.name}** is banned. Unban first.`);
-        }
+        if (!member) return interaction.editReply(`❌ UID \`${uid}\` not found in database.`);
+        if (member.role === "banned") return interaction.editReply(`🚫 **${member.name}** is banned. Unban first.`);
 
         grantDay(uid);
         logScan(uid, member.name, "GRANTED_LEADER_DAY");
@@ -531,16 +513,13 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       case "setrole": {
-        const uid  = formatUID(interaction.options.getString("uid").trim());
-        const role = interaction.options.getString("role");
+        const uid    = formatUID(interaction.options.getString("uid").trim());
+        const role   = interaction.options.getString("role");
         const member = getMember(uid);
-
-        if (!member) {
-          return interaction.editReply(`❌ UID \`${uid}\` not found in database.`);
-        }
+        if (!member) return interaction.editReply(`❌ UID \`${uid}\` not found in database.`);
 
         updateRole(uid, role);
-        const espAction = role === "banned" ? "ban" : "add";
+        const espAction = role === "banned" ? "ban" : "setrole";
         pushCommand(`setrole_${Date.now()}`, espAction, uid, member.name, role, 0);
 
         return interaction.editReply(
@@ -550,141 +529,70 @@ client.on("interactionCreate", async (interaction) => {
 
       case "list": {
         const members = getApprovedMembers();
-        if (members.length === 0) {
-          return interaction.editReply("_No approved members found._");
-        }
+        if (!members.length) return interaction.editReply("_No approved members found._");
 
-        const byRole = {};
-        for (const m of members) {
-          if (!byRole[m.role]) byRole[m.role] = [];
-          byRole[m.role].push(m);
-        }
-
-        const embed = new EmbedBuilder()
-          .setTitle("📋 Approved Members")
-          .setColor(0x00c853)
-          .setTimestamp();
-
-        for (const [role, list] of Object.entries(byRole)) {
-          embed.addFields({
-            name: `${roleEmoji(role)} ${role} (${list.length})`,
-            value: list.map((m) => `**${m.name}** — \`${m.uid}\``).join("\n"),
-          });
-        }
-
-        return interaction.editReply({ embeds: [embed] });
+        await notifyDiscord({ result: "LIST_REPLY", members });
+        return interaction.editReply("📋 Member list sent.");
       }
 
       case "pending": {
-        const pendingList = getPendingMembers();
-        if (pendingList.length === 0) {
-          return interaction.editReply("✅ No pending cards.");
-        }
+        const pending = getPendingMembers();
+        if (!pending.length) return interaction.editReply("_No pending cards._");
 
-        const embed = new EmbedBuilder()
-          .setTitle(`⏳ Pending Cards (${pendingList.length})`)
-          .setColor(0xffab00)
-          .setTimestamp();
-
-        const rows = [];
-        for (const m of pendingList) {
-          rows.push(`**${m.name || "Unknown"}** — \`${m.uid}\``);
-          rows.push(
-            `> \`/grant_day uid:${m.uid}\` to give day access · \`/ban uid:${m.uid}\` to ban permanently`
-          );
-        }
-        embed.setDescription(rows.join("\n"));
-
-        return interaction.editReply({ embeds: [embed] });
+        await notifyDiscord({ result: "PENDING_REPLY", pending });
+        return interaction.editReply("⏳ Pending list sent.");
       }
 
       case "log": {
         const count = interaction.options.getInteger("count") || 10;
-        const entries = getRecentLog(Math.min(count, 50));
+        const log   = getRecentLog(count);
+        if (!log.length) return interaction.editReply("_No log entries found._");
 
-        if (entries.length === 0) return interaction.editReply("_No scans yet._");
-
-        const lines = entries.map((e) => {
-          const status = resultLabel(e.result);
-          return `\`${e.uid}\` **${e.name}**: ${status}`;
-        });
-
-        const embed = new EmbedBuilder()
-          .setTitle("📜 Door Access History")
-          .setColor(0x2196f3)
-          .setDescription(lines.join("\n"));
-
-        return interaction.editReply({ embeds: [embed] });
+        await notifyDiscord({ result: "LOG_REPLY", log });
+        return interaction.editReply(`📜 Last ${count} log entries sent.`);
       }
 
       case "report": {
-        const stats = getStats();
-        const total = stats.total || 0;
-        const grantPct = total ? ((stats.granted / total) * 100).toFixed(1) : "0.0";
-
-        const embed = new EmbedBuilder()
-          .setTitle("📊 Access Control Report")
-          .setColor(0x9c27b0)
-          .addFields(
-            { name: "Total Scans",     value: `${total}`,                              inline: true },
-            { name: "✅ Granted",      value: `${stats.granted  || 0} (${grantPct}%)`, inline: true },
-            { name: "❌ Denied",       value: `${stats.denied   || 0}`,                inline: true },
-            { name: "🚫 Banned",       value: `${stats.banned   || 0}`,                inline: true },
-            { name: "❓ Unknown",      value: `${stats.unknown  || 0}`,                inline: true },
-            { name: "🌞 Day Grants",   value: `${stats.day_grants || 0}`,              inline: true }
-          )
-          .setTimestamp();
-
-        return interaction.editReply({ embeds: [embed] });
+        const reportData = getStats();
+        await notifyDiscord({ result: "REPORT_REPLY", reportData });
+        return interaction.editReply("📊 Report sent.");
       }
 
       case "status": {
-        pushCommand(`status_${Date.now()}`, "get_status", "", "", "", 0);
-        return interaction.editReply(
-          "📡 Status request sent to ESP32. Response will appear in the notification channel."
-        );
+        pushCommand(`status_${Date.now()}`, "status", "", "", "", 0);
+        return interaction.editReply("📡 Status request sent to ESP32. Response will appear shortly.");
       }
 
       default:
-        return interaction.editReply("Unknown command.");
+        return interaction.editReply("❓ Unknown command.");
     }
-
   } catch (err) {
-    console.error(`[Bot] Command error (${commandName}):`, err);
-    return interaction.editReply("❌ An error occurred. Check server logs.");
+    console.error(`[Bot] Error handling /${commandName}:`, err);
+    return interaction.editReply("❌ An error occurred. Check server logs.").catch(() => {});
   }
 });
 
 // ════════════════════════════════════════════════════════════
-// BOT READY
+// CLIENT READY
 // ════════════════════════════════════════════════════════════
 client.once("ready", async () => {
   console.log(`[Bot] Logged in as ${client.user.tag}`);
-  await registerCommands();
 
-  const savedChannelId = getChannelId() || CHANNEL_ID;
-
+  // Restore saved notification channel from DB
+  const savedChannelId = getChannelId();
   if (savedChannelId) {
     try {
       notifyChannel = await client.channels.fetch(savedChannelId);
-      console.log(`[Bot] Notify channel loaded: #${notifyChannel.name}`);
-    } catch (e) {
-      console.warn("[Bot] Could not load saved channel:", e.message);
-      console.warn("[Bot] Use /setchannel in any channel to configure notifications.");
+      console.log(`[Bot] Restored notify channel: ${savedChannelId}`);
+    } catch {
+      console.warn(`[Bot] Could not restore channel ${savedChannelId}`);
     }
-  } else {
-    console.warn("[Bot] No channel configured. Use /setchannel in Discord to set one.");
   }
+
+  await registerCommands();
 });
 
 // ════════════════════════════════════════════════════════════
-// START BOT
+// EXPORTS
 // ════════════════════════════════════════════════════════════
-const startBot = async () => {
-  await client.login(BOT_TOKEN);
-};
-
-module.exports = { 
-  startBot, 
-  notifyDiscord 
-};
+module.exports = { client, notifyDiscord };
