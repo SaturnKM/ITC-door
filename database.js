@@ -1,6 +1,5 @@
 // ============================================================
 // DATABASE — SQLite via better-sqlite3
-// FIXED: unixepoch() compatibility, stats fields
 // ============================================================
 const Database = require("better-sqlite3");
 const path = require("path");
@@ -8,12 +7,8 @@ const path = require("path");
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "access.db");
 const db = new Database(DB_PATH);
 
-// ── Enable WAL mode for reliability ─────────────────────────
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
-
-// Helper for Unix timestamp (compatible with older SQLite)
-const nowUnix = () => Math.floor(Date.now() / 1000);
 
 // ── Schema ───────────────────────────────────────────────────
 db.exec(`
@@ -27,15 +22,15 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS scan_log (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    uid       TEXT    NOT NULL,
-    name      TEXT    NOT NULL DEFAULT 'Unknown',
-    result    TEXT    NOT NULL,
-    scanned_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid         TEXT    NOT NULL,
+    name        TEXT    NOT NULL DEFAULT 'Unknown',
+    result      TEXT    NOT NULL,
+    scanned_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
   );
 
   CREATE TABLE IF NOT EXISTS day_grants (
-    uid       TEXT    NOT NULL,
+    uid         TEXT    NOT NULL,
     granted_day INTEGER NOT NULL,
     PRIMARY KEY (uid, granted_day)
   );
@@ -46,46 +41,47 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS pending_commands (
-    id        TEXT    PRIMARY KEY,
-    action    TEXT    NOT NULL,
-    uid       TEXT    NOT NULL DEFAULT '',
-    name      TEXT    NOT NULL DEFAULT '',
-    role      TEXT    NOT NULL DEFAULT '',
-    count     INTEGER NOT NULL DEFAULT 10,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    acked     INTEGER NOT NULL DEFAULT 0
+    id          TEXT    PRIMARY KEY,
+    action      TEXT    NOT NULL,
+    uid         TEXT    NOT NULL DEFAULT '',
+    name        TEXT    NOT NULL DEFAULT '',
+    role        TEXT    NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    acked       INTEGER NOT NULL DEFAULT 0
   );
 `);
 
-// ── Seed default members from original CSV if table is empty ─
+// ── Seed default members ─────────────────────────────────────
 const seedMembers = () => {
   const count = db.prepare("SELECT COUNT(*) as c FROM members").get().c;
   if (count > 0) return;
 
+  // NOTE: roles use exact strings the ESP32 checks:
+  //   "President" | "ExclusiveBoard" | "Leader" | "Member" | "banned" | "pending"
   const defaults = [
-    { name: "Islem",        uid: "0002787912", role: "Leader"         },
-    { name: "Djilali",      uid: "0007680714", role: "Exclusive board" },
-    { name: "Ibtissem",     uid: "0006505824", role: "Leader"         },
-    { name: "Feriel",       uid: "0009860301", role: "Leader"         },
-    { name: "Ismail",       uid: "0007875382", role: "Leader"         },
-    { name: "Khadidja",     uid: "0003752638", role: "Leader"         },
-    { name: "abdelmadjid",  uid: "0010619675", role: "Leader"         },
-    { name: "Abdellah",     uid: "0006579751", role: "Leader"         },
-    { name: "Mahdi",        uid: "0008321581", role: "Leader"         },
-    { name: "Anis",         uid: "0007869479", role: "Leader"         },
-    { name: "maroua",       uid: "0009686941", role: "Leader"         },
-    { name: "djamel",       uid: "0014351112", role: "Leader"         },
-    { name: "Abd Erraouf",  uid: "0004022966", role: "Leader"         },
-    { name: "amira",        uid: "0006819271", role: "Exclusive board" },
-    { name: "Lafdal",       uid: "0002672952", role: "Leader"         },
-    { name: "IKHLAS",       uid: "0014755425", role: "Leader"         },
-    { name: "YAZI",         uid: "0006527607", role: "President"      },
-    { name: "Ziouani",      uid: "0014692887", role: "Exclusive board" },
-    { name: "Dhaia",        uid: "0009660230", role: "Leader"         },
-    { name: "adem",         uid: "0006557881", role: "Exclusive board" },
-    { name: "Ibrahim",      uid: "0010940033", role: "Leader"         },
-    { name: "Nour",         uid: "0014883107", role: "Exclusive board" },
-    { name: "dounia",       uid: "0006587684", role: "Leader"         },
+    { name: "Islem",        uid: "0002787912", role: "Leader"        },
+    { name: "Djilali",      uid: "0007680714", role: "ExclusiveBoard"},
+    { name: "Ibtissem",     uid: "0006505824", role: "Leader"        },
+    { name: "Feriel",       uid: "0009860301", role: "Leader"        },
+    { name: "Ismail",       uid: "0007875382", role: "Leader"        },
+    { name: "Khadidja",     uid: "0003752638", role: "Leader"        },
+    { name: "abdelmadjid",  uid: "0010619675", role: "Leader"        },
+    { name: "Abdellah",     uid: "0006579751", role: "Leader"        },
+    { name: "Mahdi",        uid: "0008321581", role: "Leader"        },
+    { name: "Anis",         uid: "0007869479", role: "Leader"        },
+    { name: "maroua",       uid: "0009686941", role: "Leader"        },
+    { name: "djamel",       uid: "0014351112", role: "Leader"        },
+    { name: "Abd Erraouf",  uid: "0004022966", role: "Leader"        },
+    { name: "amira",        uid: "0006819271", role: "ExclusiveBoard"},
+    { name: "Lafdal",       uid: "0002672952", role: "Leader"        },
+    { name: "IKHLAS",       uid: "0014755425", role: "Leader"        },
+    { name: "YAZI",         uid: "0006527607", role: "President"     },
+    { name: "Ziouani",      uid: "0014692887", role: "ExclusiveBoard"},
+    { name: "Dhaia",        uid: "0009660230", role: "Leader"        },
+    { name: "adem",         uid: "0006557881", role: "ExclusiveBoard"},
+    { name: "Ibrahim",      uid: "0010940033", role: "Leader"        },
+    { name: "Nour",         uid: "0014883107", role: "ExclusiveBoard"},
+    { name: "dounia",       uid: "0006587684", role: "Leader"        },
   ];
 
   const insert = db.prepare(
@@ -108,11 +104,9 @@ const getMember = (uid) =>
   db.prepare("SELECT * FROM members WHERE uid = ?").get(uid);
 
 const getApprovedMembers = () =>
-  db
-    .prepare(
-      "SELECT * FROM members WHERE role NOT IN ('banned','pending') ORDER BY name COLLATE NOCASE"
-    )
-    .all();
+  db.prepare(
+    "SELECT * FROM members WHERE role NOT IN ('banned','pending') ORDER BY name COLLATE NOCASE"
+  ).all();
 
 const getPendingMembers = () =>
   db.prepare("SELECT * FROM members WHERE role = 'pending' ORDER BY added_at DESC").all();
@@ -129,9 +123,7 @@ const upsertMember = (uid, name, role, addedBy = "bot") => {
 };
 
 const updateRole = (uid, newRole) => {
-  const result = db
-    .prepare("UPDATE members SET role = ? WHERE uid = ?")
-    .run(newRole, uid);
+  const result = db.prepare("UPDATE members SET role = ? WHERE uid = ?").run(newRole, uid);
   return result.changes > 0;
 };
 
@@ -143,102 +135,80 @@ const logScan = (uid, name, result) =>
   db.prepare("INSERT INTO scan_log (uid, name, result) VALUES (?, ?, ?)").run(uid, name, result);
 
 const getRecentLog = (n = 10) =>
-  db
-    .prepare(
-      "SELECT * FROM scan_log ORDER BY scanned_at DESC LIMIT ?"
-    )
-    .all(n);
+  db.prepare("SELECT * FROM scan_log ORDER BY scanned_at DESC LIMIT ?").all(n);
 
-// FIXED: Added missing stats fields
 const getStats = () =>
-  db
-    .prepare(`
-      SELECT
-        COUNT(*)                                          AS total,
-        SUM(result LIKE 'GRANTED%')                      AS granted,
-        SUM(result LIKE 'DENIED%')                       AS denied,
-        SUM(result = 'BANNED')                           AS banned,
-        SUM(result = 'NOT_IN_LIST')                      AS unknown,
-        SUM(result = 'GRANTED_ONCE')                     AS once,
-        SUM(result = 'GRANTED_REMOTE')                   AS remote,
-        SUM(result = 'GRANTED_LEADER_DAY')               AS day_grants
-      FROM scan_log
-    `)
-    .get();
+  db.prepare(`
+    SELECT
+      COUNT(*)                            AS total,
+      SUM(result LIKE 'GRANTED%')         AS granted,
+      SUM(result LIKE 'DENIED%')          AS denied,
+      SUM(result = 'BANNED')              AS banned,
+      SUM(result = 'NOT_IN_LIST')         AS unknown,
+      SUM(result = 'GRANTED_ONCE')        AS once,
+      SUM(result = 'GRANTED_REMOTE')      AS remote,
+      SUM(result = 'GRANTED_LEADER_DAY')  AS day_grants
+    FROM scan_log
+  `).get();
 
 // ════════════════════════════════════════════════════════════
-// DAY GRANTS (FIXED: uses UTC consistently)
+// DAY GRANTS  (UTC day-of-year as integer key)
 // ════════════════════════════════════════════════════════════
 
 const todayDOY = () => {
-  const now = new Date();
-  // Use UTC to avoid timezone issues
+  const now   = new Date();
   const start = new Date(Date.UTC(now.getUTCFullYear(), 0, 0));
-  const diff = now.getTime() - start.getTime();
-  return Math.floor(diff / 86400000);
+  return Math.floor((now.getTime() - start.getTime()) / 86400000);
 };
 
-const isGrantedToday = (uid) => {
-  const row = db
-    .prepare("SELECT 1 FROM day_grants WHERE uid = ? AND granted_day = ?")
-    .get(uid, todayDOY());
-  return !!row;
-};
+const isGrantedToday = (uid) =>
+  !!db.prepare("SELECT 1 FROM day_grants WHERE uid = ? AND granted_day = ?").get(uid, todayDOY());
 
-const grantDay = (uid) => {
-  db
-    .prepare(
-      "INSERT OR IGNORE INTO day_grants (uid, granted_day) VALUES (?, ?)"
-    )
-    .run(uid, todayDOY());
-};
+const grantDay = (uid) =>
+  db.prepare("INSERT OR IGNORE INTO day_grants (uid, granted_day) VALUES (?, ?)").run(uid, todayDOY());
+
+const revokeDay = (uid) =>
+  db.prepare("DELETE FROM day_grants WHERE uid = ? AND granted_day = ?").run(uid, todayDOY());
 
 // ════════════════════════════════════════════════════════════
 // PENDING COMMANDS
 // ════════════════════════════════════════════════════════════
 
-const pushCommand = (id, action, uid = "", name = "", role = "", count = 10) => {
+const pushCommand = (id, action, uid = "", name = "", role = "") => {
   db.prepare(`
-    INSERT OR IGNORE INTO pending_commands (id, action, uid, name, role, count)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(id, action, uid, name, role, count);
+    INSERT OR IGNORE INTO pending_commands (id, action, uid, name, role)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id, action, uid, name, role);
 };
 
 const getPendingCommands = () =>
-  db
-    .prepare("SELECT * FROM pending_commands WHERE acked = 0 ORDER BY created_at ASC")
-    .all();
+  db.prepare("SELECT * FROM pending_commands WHERE acked = 0 ORDER BY created_at ASC").all();
 
 const ackCommand = (id) =>
   db.prepare("UPDATE pending_commands SET acked = 1 WHERE id = ?").run(id);
 
-// ════════════════════════════════════════════════════════════
-// CLEANUP
-// ════════════════════════════════════════════════════════════
+// ── Cleanup old acked commands every hour ────────────────────
 setInterval(() => {
-  const deleted = db
-    .prepare(
-      "DELETE FROM pending_commands WHERE acked = 1 AND created_at < strftime('%s', 'now') - 86400"
-    )
-    .run();
-  if (deleted.changes > 0)
-    console.log(`[DB] Cleaned up ${deleted.changes} old commands`);
-}, 3600_000);
+  const deleted = db.prepare(
+    "DELETE FROM pending_commands WHERE acked = 1 AND created_at < strftime('%s','now') - 86400"
+  ).run();
+  if (deleted.changes > 0) console.log(`[DB] Cleaned ${deleted.changes} old commands`);
+}, 3_600_000);
 
 // ════════════════════════════════════════════════════════════
 // SETTINGS
 // ════════════════════════════════════════════════════════════
 
-const saveSetting = (key, value) =>
+const saveSetting  = (key, value) =>
   db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
 
-const getSetting = (key) => {
+const getSetting   = (key) => {
   const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key);
   return row ? row.value : null;
 };
 
-const saveChannelId = (channelId) => saveSetting("notify_channel_id", channelId);
-const getChannelId = () => getSetting("notify_channel_id");
+const saveChannelId = (id)  => saveSetting("notify_channel_id", id);
+const getChannelId  = ()    => getSetting("notify_channel_id");
 
 module.exports = {
   db,
@@ -253,6 +223,7 @@ module.exports = {
   getStats,
   isGrantedToday,
   grantDay,
+  revokeDay,
   pushCommand,
   getPendingCommands,
   ackCommand,
