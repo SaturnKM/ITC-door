@@ -1,1345 +1,868 @@
-/*
-============================================================
-RFID ACCESS CONTROL - @exlusif_board EDITION
-Platform : ESP32-C3 Mini
-============================================================
-CHANGES:
-  - Fixed tone() not supported on ESP32-C3 (using LEDC)
-  - Fixed isHexadecimalDigit() implementation
-  - Fixed memmove pointer issues in day grant/block lists
-  - Non-blocking unknown card handling
-  - Fixed all compilation issues
-============================================================ */
+// ─────────────────────────────────────────────────────────────────────────────
+//  RFID Access Control — ESP32-C3 Super Mini  v4.0
+//  Hardware:
+//    RDM6300 RFID (TX→GPIO20), LCD 16×2 I²C (SDA=8,SCL=9)
+//    LEDs: Green-access(5) Red-access(6) Yellow-busy(7) Green-WiFi(4) Red-err(3)
+//    Buzzer(2)  Door-relay(10, active-HIGH)
+//  Libraries: ArduinoJson, LiquidCrystal_I2C (Frank de Brabander)
+// ─────────────────────────────────────────────────────────────────────────────
 
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-#include <LittleFS.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <time.h>
 #include <ArduinoJson.h>
+#include "LittleFS.h"
+#include <time.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
-// ════════════════════════════════════════════════════════════
-// PIN DEFINITIONS
-// ════════════════════════════════════════════════════════════
-#define RELAY       5
-#define SIGNAL_PIN  3
+// ─── USER CONFIG ──────────────────────────────────────────────────────────────
+#define WIFI_SSID        "DOOR_ACCESS"
+#define WIFI_PASSWORD    "DOOR_ACCESS"
+#define SERVER_URL       "https://rfid.robtic.org"
+#define API_KEY          "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+"
+#define TIMEZONE_STR     "CET-1"          // Algeria UTC+1, no DST
 
-#define RFID_SERIAL  Serial1
-#define RFID_RX_PIN  20
-#define RFID_TX_PIN  21
+// ─── PINS ─────────────────────────────────────────────────────────────────────
+#define PIN_RFID_RX      20
+#define PIN_LED_A_GREEN   5
+#define PIN_LED_A_RED     6
+#define PIN_LED_YELLOW    7
+#define PIN_LED_WIFI      4
+#define PIN_LED_ERROR     3
+#define PIN_BUZZER        2
+#define PIN_RELAY        10
 
-// ════════════════════════════════════════════════════════════
-// CONFIGURATION
-// ════════════════════════════════════════════════════════════
-#define ACTIVE_BUZZER   true   // Changed to true since tone() not available on ESP32-C3
-#define SKIP_TIME_CHECK false
-#define FORCE_REWRITE   false
+// ─── LCD ──────────────────────────────────────────────────────────────────────
+#define LCD_ADDR  0x27   // try 0x3F if blank
+#define LCD_COLS  16
+#define LCD_ROWS   2
+#define I2C_SDA    8
+#define I2C_SCL    9
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
-const char* WIFI_SSID  = "DOOR_ACCESS";
-const char* WIFI_PASS  = "DOOR_ACCESS";
-const char* SERVER_URL = "https://rfid.robtic.org";
-const char* API_KEY    = "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+";
+// ─── CUSTOM LCD CHARACTERS (CGRAM slots 0-5) ──────────────────────────────────
+byte CC_LOCK[8]   = {0x0E,0x11,0x11,0x1F,0x1B,0x1B,0x1F,0x00};
+byte CC_UNLOCK[8] = {0x0E,0x10,0x10,0x1F,0x1B,0x1B,0x1F,0x00};
+byte CC_WIFI[8]   = {0x00,0x0E,0x11,0x04,0x0A,0x00,0x04,0x00};
+byte CC_BELL[8]   = {0x04,0x0E,0x0E,0x0E,0x1F,0x00,0x04,0x00};
+byte CC_PERSON[8] = {0x04,0x0E,0x04,0x0E,0x15,0x04,0x0A,0x11};
+byte CC_DOOR[8]   = {0x0F,0x09,0x0B,0x09,0x0F,0x09,0x09,0x1F};
 
-const int ACCESS_HOUR_START = 10;
-const int ACCESS_HOUR_END   = 18;
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+#define MAX_MEMBERS        400
+#define CSV_PATH           "/members.csv"
+#define PENDING_TIMEOUT    60000UL
+#define POLL_INTERVAL_MS    3000UL
+#define UPDATE_INTERVAL    30000UL
+#define STATUS_INTERVAL    60000UL
+#define IDLE_CLOCK_INTERVAL 5000UL
+#define ACCESS_HOUR_START     10
+#define ACCESS_HOUR_END       16
 
-const long  NTP_GMT_OFFSET_SEC  = 3600;
-const int   NTP_DAYLIGHT_OFFSET = 0;
-
-const unsigned long SCAN_COOLDOWN_MS  = 8000;
-const unsigned long DOOR_OPEN_MS      = 3000;
-const unsigned long LED_HOLD_MS       = 1500;
-const unsigned long POLL_INTERVAL_MS  = 5000;
-const unsigned long NTP_RETRY_MS      = 30000;
-const unsigned long WIFI_RETRY_MS     = 15000;
-const unsigned long UNKNOWN_WAIT_MS   = 30000;  // Non-blocking wait
-
-#define QUEUE_MAX 30
-
-// ════════════════════════════════════════════════════════════
-// EMBEDDED ACCESS LIST (offline cache for board/president)
-// ════════════════════════════════════════════════════════════
-const char* DEFAULT_CSV =
-  "Full Name,UID,Role\n"
-  "Islem,0002787912,Leader\n"
-  "Djilali,0007680714,Exclusive board\n"
-  "Ibtissem,0006505824,Leader\n"
-  "Feriel,0009860301,Leader\n"
-  "Ismail,0007875382,Leader\n"
-  "Khadidja,0003752638,Leader\n"
-  "abdelmadjid,0010619675,Leader\n"
-  "Abdellah,0006579751,Leader\n"
-  "Mahdi,0008321581,Leader\n"
-  "Anis,0007869479,Leader\n"
-  "maroua,0009686941,Leader\n"
-  "djamel,0014351112,Leader\n"
-  "Abd Erraouf,0004022966,Leader\n"
-  "amira,0006819271,Exclusive board\n"
-  "Lafdal,0002672952,Leader\n"
-  "IKHLAS,0014755425,Leader\n"
-  "YAZI,0006527607,President\n"
-  "Ziouani,0014692887,Exclusive board\n"
-  "Dhaia,0009660230,Leader\n"
-  "adem,0006557881,Exclusive board\n"
-  "Ibrahim,0010940033,Leader\n"
-  "Nour,0014883107,Exclusive board\n"
-  "dounia,0006587684,Leader\n";
-
-// ════════════════════════════════════════════════════════════
-// PRESIDENT MESSAGES
-// ════════════════════════════════════════════════════════════
-const char* PRESIDENT_MSGS[] = {
-  "THE BOSS IS IN",
-  "WELCOME CHIEF!",
-  "VIP ACCESS :)",
-  "BOSS MODE ON",
-  "MAKE WAY !!!",
-  "YES SIR!!!!!"
+// ─── MEMBER RECORD ────────────────────────────────────────────────────────────
+struct Member {
+  char uid[12];
+  char name[33];
+  char role[20];
+  bool dayGrant;
+  char dayGrantDate[11];
 };
-const int PRESIDENT_MSG_COUNT = 6;
-int presidentMsgIdx = 0;
 
-// ════════════════════════════════════════════════════════════
-// SOUND TYPES (for active buzzer)
-// ════════════════════════════════════════════════════════════
-#define SND_GRANTED_LEADER    1
-#define SND_GRANTED_BOARD     2
-#define SND_GRANTED_PRESIDENT 3
-#define SND_BANNED            4
-#define SND_UNKNOWN           5
-#define SND_DENIED            6
-#define SND_ERROR             7
-#define SND_WIFI_OK           8
+Member members[MAX_MEMBERS];
+int    memberCount = 0;
 
-// ════════════════════════════════════════════════════════════
-// GLOBALS
-// ════════════════════════════════════════════════════════════
-LiquidCrystal_I2C lcd(0x27, 16, 2);
-
-unsigned long lastScanTime     = 0;
-unsigned long lastPollTime     = 0;
-unsigned long lastClockRefresh = 0;
-unsigned long lastNtpAttempt   = 0;
-
-bool fsReady       = false;
-bool wifiConnected = false;
-bool timeReady     = false;
-
-// ── Non-blocking unknown card state machine ──────────────────
-enum UnknownState {
-  UNKNOWN_IDLE,
-  UNKNOWN_WAITING_WIFI,
-  UNKNOWN_WAITING_RESPONSE
+// ─── DEFAULT SEED — built into firmware, loaded if CSV missing ────────────────
+struct Seed { const char* uid; const char* name; const char* role; };
+const Seed DEFAULTS[] = {
+  {"0002787912", "Islem",       "Leader"       },
+  {"0007680714", "Djilali",     "ExclusiveBoard"},
+  {"0006505824", "Ibtissem",    "Leader"       },
+  {"0009860301", "Feriel",      "Leader"       },
+  {"0007875382", "Ismail",      "Leader"       },
+  {"0003752638", "Khadidja",    "Leader"       },
+  {"0010619675", "abdelmadjid", "Leader"       },
+  {"0006579751", "Abdellah",    "Leader"       },
+  {"0008321581", "Mahdi",       "Leader"       },
+  {"0007869479", "Anis",        "Leader"       },
+  {"0009686941", "maroua",      "Leader"       },
+  {"0014351112", "djamel",      "Leader"       },
+  {"0004022966", "Abd Erraouf", "Leader"       },
+  {"0006819271", "amira",       "ExclusiveBoard"},
+  {"0002672952", "Lafdal",      "Leader"       },
+  {"0014755425", "IKHLAS",      "Leader"       },
+  {"0006527607", "YAZI",        "President"    },
+  {"0014692887", "Ziouani",     "ExclusiveBoard"},
+  {"0009660230", "Dhaia",       "Leader"       },
+  {"0006557881", "adem",        "ExclusiveBoard"},
+  {"0010940033", "Ibrahim",     "Leader"       },
+  {"0014883107", "Nour",        "ExclusiveBoard"},
+  {"0006587684", "dounia",      "Leader"       },
 };
-UnknownState unknownState = UNKNOWN_IDLE;
-unsigned long unknownStartTime = 0;
-String pendingUnknownUID = "";
-unsigned long unknownScanTime = 0;
+const int DEFAULTS_COUNT = (int)(sizeof(DEFAULTS)/sizeof(DEFAULTS[0]));
 
-// ── Offline event queue ──────────────────────────────────────
-struct QueueEntry {
-  char uid[11];
-  char name[24];
-  char result[28];
-};
-QueueEntry eventQueue[QUEUE_MAX];
-int queueCount = 0;
+// ─── RFID ─────────────────────────────────────────────────────────────────────
+HardwareSerial rfidSerial(1);
+#define RFID_BAUD  9600
+#define RFID_STX   0x02
+#define RFID_ETX   0x03
+#define RFID_LEN   14
+uint8_t rfidBuf[RFID_LEN];
+int     rfidPos = 0;
 
-// ── Day grant list (RAM only, resets at midnight) ─────────────
-#define GRANT_LIST_MAX 20
-char grantedUIDs[GRANT_LIST_MAX][11];
-int  grantedCount = 0;
-int  grantedDay   = -1;
+// ─── TIMERS ───────────────────────────────────────────────────────────────────
+unsigned long lastUpdatePoll = 0;
+unsigned long lastStatusPost = 0;
+unsigned long lastIdleClock  = 0;
+unsigned long bootMillis     = 0;
+bool          wifiAvailable  = false;
 
-// ── Day block list (RAM only, resets at midnight) ─────────────
-#define BLOCK_LIST_MAX 20
-char blockedUIDs[BLOCK_LIST_MAX][11];
-int  blockedCount = 0;
-int  blockedDay   = -1;
+// ─── FORWARD DECLARATIONS ────────────────────────────────────────────────────
+void  seedDefaults();
+void  loadCSV();
+void  saveCSV();
+int   findMember(const char*);
+void  upsertMember(const char*,const char*,const char*,bool,const char*);
+void  removeDayGrantsIfNewDay();
+bool  tryConnectWiFi();
+bool  checkScan(const char*,char*,bool*);
+bool  postScan(const char*,const char*,const char*);
+bool  pollCommands();
+void  postStatus();
+void  processCard(const char*);
+void  handleUnknownCard(const char*,const char*,const char*);
+void  grantAccess(const char*,const char*,const char*,const char*);
+void  denyAccess(const char*,const char*,const char*,const char*);
+void  openDoor();
+void  buzz(int);
+void  ledAccess(bool,unsigned long);
+void  setWifiLed(bool); void setErrorLed(bool); void setYellow(bool);
+bool  parseRFID(char*);
+void  getToday(char*); int currentHour(); bool inAccessWindow();
+bool  is247Role(const char*); bool isTimeRole(const char*);
+const char* shortRole(const char*);
+void  lcdInit(); void lcdMsg(const char*,const char*);
+void  lcdPrint16(int,const char*); void lcdScroll(int,const char*,int,int);
+void  lcdAnimateBoot(); void lcdIdle();
+void  lcdScanning(const char*);
+void  lcdGranted(const char*,const char*);
+void  lcdDenied(const char*,const char*);
+void  lcdPending(unsigned long);
+void  lcdWifiConnecting(); void lcdOffline();
+static uint8_t h2n(uint8_t);
 
-// ════════════════════════════════════════════════════════════
-// FORWARD DECLARATIONS
-// ════════════════════════════════════════════════════════════
-void     lcdPrint(const char* l1, const char* l2);
-void     lcdPrint(String l1, String l2);
-String   centerName(String name);
-String   padUID(unsigned long uid);
-void     playSound(int soundType);
-void     showIdle();
-void     openDoor();
-bool     ensureWifi();
-bool     ensureWifiNonBlocking();  // Non-blocking version
-void     syncNTP();
-void     checkAccess(unsigned long uid);
-void     flushQueue();
-bool     sendToServer(const char* uid, const char* name, const char* result);
-void     scanUnknown(const char* uid);
-String   checkWithServer(const char* uid, const char* name);
-void     pollCommands();
-bool     executeCommand(const String& action, const String& uid,
-                        const String& name, const String& role, int count);
-void     sendAck(const String& cmdId, bool ok);
-bool     updateRoleInCSV(const String& targetUID, const String& newRole);
-bool     addToCSV(const String& uid, const String& name, const String& role);
-bool     isGrantedToday(const char* uid);
-void     grantDayAccess(const char* uid);
-bool     isBlockedToday(const char* uid);
-void     blockDayAccess(const char* uid);
-void     revokeDayAccess(const char* uid);  // Added for revoke_day command
-void     checkMidnightReset();
-void     accessGrantedLeader(String name, bool dayGrant);
-void     accessGrantedBoard(String name);
-void     accessGrantedPresident(String name);
-void     accessBanned(String name);
-void     accessDeniedHours(String name);
-void     accessDeniedBlocked(String name);
-void     accessUnknown(unsigned long uid);
-void     accessDenied(String name, const char* reason);
-void     queueEvent(const char* uid, const char* name, const char* result);
-unsigned long readUID();
-void     flushRFID();
-bool     isWithinAccessHours();
-String   buildURL(const char* path);
-int      httpPost(const String& url, const String& body);
-int      httpGet(const String& url, String& responseOut);
-bool     isHexDigit(char c);
-void     processUnknownCard();  // Non-blocking unknown card handler
-
-// ════════════════════════════════════════════════════════════
-// SETUP
-// ════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  delay(400);
 
-  RFID_SERIAL.begin(9600, SERIAL_8N1, RFID_RX_PIN, RFID_TX_PIN);
+  const uint8_t outPins[] = {PIN_LED_A_GREEN,PIN_LED_A_RED,PIN_LED_YELLOW,
+                              PIN_LED_WIFI,PIN_LED_ERROR,PIN_BUZZER,PIN_RELAY};
+  for (uint8_t p : outPins) { pinMode(p,OUTPUT); digitalWrite(p,LOW); }
 
-  pinMode(RELAY, OUTPUT);
-  pinMode(SIGNAL_PIN, OUTPUT);
-  digitalWrite(RELAY, LOW);
-  digitalWrite(SIGNAL_PIN, LOW);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  lcdInit();
+  lcdAnimateBoot();
 
-  Wire.begin(6, 7);
-  lcd.init();
-  lcd.backlight();
-  lcdPrint(" @exlusif_board", "  Booting...");
-  delay(800);
+  rfidSerial.begin(RFID_BAUD, SERIAL_8N1, PIN_RFID_RX, -1);
 
   if (!LittleFS.begin(true)) {
-    Serial.println(F("STARTUP_ERROR: LittleFS failed"));
-    lcdPrint(" Flash Error!", " Re-flash ESP32");
-    playSound(SND_ERROR);
-    delay(3000);
-  } else {
-    fsReady = true;
-    Serial.println(F("STARTUP_OK: LittleFS mounted"));
-
-    if (!LittleFS.exists("/access.csv") || FORCE_REWRITE) {
-      lcdPrint(" Writing list...", " Please wait");
-      File f = LittleFS.open("/access.csv", "w");
-      if (f) {
-        f.print(DEFAULT_CSV);
-        f.close();
-        Serial.println(F("access.csv written OK"));
-      } else {
-        lcdPrint(" Write Failed", " Check flash");
-        playSound(SND_ERROR);
-        delay(3000);
-      }
-    } else {
-      Serial.println(F("access.csv found in flash"));
-    }
+    Serial.println("[FS] Mount failed");
+    setErrorLed(true);
+    lcdMsg("  FS  ERROR!  ", " Check flash...");
+    delay(2000); setErrorLed(false);
   }
 
-  showIdle();
-  Serial.println(F("SYSTEM_READY"));
-}
+  loadCSV();
+  bootMillis = millis();
 
-// ════════════════════════════════════════════════════════════
-// MAIN LOOP
-// ════════════════════════════════════════════════════════════
-void loop() {
+  lcdWifiConnecting();
+  wifiAvailable = tryConnectWiFi();
 
-  // ── Process unknown card state machine (non-blocking) ──────
-  if (unknownState != UNKNOWN_IDLE) {
-    processUnknownCard();
-  }
-
-  // ── RFID scan ─────────────────────────────────────────────
-  if (RFID_SERIAL.available() && unknownState == UNKNOWN_IDLE) {
-    unsigned long uid = readUID();
-    if (uid > 0) {
-      if (millis() - lastScanTime < SCAN_COOLDOWN_MS) {
-        flushRFID();
-        return;
-      }
-      lastScanTime = millis();
-      String uidStr = padUID(uid);
-      Serial.print(F("SCAN: ")); Serial.println(uidStr);
-      lcdPrint(" Scanning...", " Please wait");
-
-      if (!fsReady) {
-        lcdPrint(" Flash Error!", " Cannot check");
-        playSound(SND_ERROR);
-      } else {
-        checkAccess(uid);
-      }
-
-      flushRFID();
-      delay(400);
-      showIdle();
-    }
-  }
-
-  // ── Retry NTP if not synced ───────────────────────────────
-  if (!timeReady && wifiConnected &&
-      millis() - lastNtpAttempt > NTP_RETRY_MS) {
-    syncNTP();
-  }
-
-  // ── Flush offline queue ───────────────────────────────────
-  if (wifiConnected && queueCount > 0) flushQueue();
-
-  // ── Poll bot commands ─────────────────────────────────────
-  if (wifiConnected && millis() - lastPollTime > POLL_INTERVAL_MS) {
-    lastPollTime = millis();
+  if (wifiAvailable) {
+    configTzTime(TIMEZONE_STR, "pool.ntp.org", "time.cloudflare.com");
+    lcdMsg(" Syncing time  ", "  please wait  ");
+    delay(2000);
     pollCommands();
-  }
-
-  // ── Refresh idle clock every second ──────────────────────
-  if (millis() - lastClockRefresh > 1000) {
-    lastClockRefresh = millis();
-    showIdle();
-  }
-}
-
-// ════════════════════════════════════════════════════════════
-// NON-BLOCKING UNKNOWN CARD HANDLER
-// ════════════════════════════════════════════════════════════
-void processUnknownCard() {
-  switch (unknownState) {
-    case UNKNOWN_WAITING_WIFI:
-      if (ensureWifiNonBlocking()) {
-        // WiFi connected, now ask server
-        unknownState = UNKNOWN_WAITING_RESPONSE;
-        unknownStartTime = millis();
-        scanUnknown(pendingUnknownUID.c_str());
-        lcdPrint("? Pending...", " Waiting for bot");
-      } else if (millis() - unknownStartTime > WIFI_RETRY_MS) {
-        // WiFi timeout
-        lcdPrint("? No Connection", " Cannot Ask Bot");
-        playSound(SND_ERROR);
-        unknownState = UNKNOWN_IDLE;
-        pendingUnknownUID = "";
-      }
-      break;
-
-    case UNKNOWN_WAITING_RESPONSE:
-      if (millis() - unknownStartTime > UNKNOWN_WAIT_MS) {
-        // Timeout - no response
-        lcdPrint("? No Response", " Try Again Later");
-        playSound(SND_DENIED);
-        unknownState = UNKNOWN_IDLE;
-        pendingUnknownUID = "";
-      } else {
-        // Check for commands targeting this UID
-        String payload;
-        int code = httpGet(buildURL("/discord/check/commands"), payload);
-        if (code == 200) {
-          DynamicJsonDocument doc(2048);
-          if (!deserializeJson(doc, payload)) {
-            JsonArray cmds = doc["commands"].as<JsonArray>();
-            for (JsonObject cmd : cmds) {
-              String cmdId  = cmd["id"]     | "";
-              String action = cmd["action"] | "";
-              String cmdUID = cmd["uid"]    | "";
-              String name   = cmd["name"]   | "";
-              String role   = cmd["role"]   | "";
-
-              bool isForUs = (cmdUID == pendingUnknownUID) ||
-                             (action == "open_door" && cmdUID.length() == 0);
-
-              if (!isForUs) continue;
-
-              Serial.printf("PENDING_RESOLVED: %s -> %s\n", cmdId.c_str(), action.c_str());
-              bool ok = executeCommand(action, cmdUID, name, role, cmd["count"] | 10);
-              sendAck(cmdId, ok);
-
-              if (action == "grant_once") {
-                sendToServer(pendingUnknownUID.c_str(), "Unknown", "GRANTED_ONCE");
-              }
-
-              unknownState = UNKNOWN_IDLE;
-              pendingUnknownUID = "";
-              break;
-            }
-          }
-        }
-        // Update countdown on LCD every second
-        int secsLeft = (UNKNOWN_WAIT_MS - (millis() - unknownStartTime)) / 1000;
-        if (secsLeft >= 0) {
-          String line2 = " Waiting: ";
-          line2 += secsLeft;
-          line2 += "s";
-          lcdPrint("? Pending...", line2);
-        }
-        delay(100);  // Small delay to prevent overwhelming the server
-      }
-      break;
-  }
-}
-
-// ════════════════════════════════════════════════════════════
-// URL BUILDER
-// ════════════════════════════════════════════════════════════
-String buildURL(const char* path) {
-  return String(SERVER_URL) + String(path);
-}
-
-// ════════════════════════════════════════════════════════════
-// HEX DIGIT CHECK
-// ════════════════════════════════════════════════════════════
-bool isHexDigit(char c) {
-  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
-}
-
-// ════════════════════════════════════════════════════════════
-// WIFI — quick connect (used for known members)
-// ════════════════════════════════════════════════════════════
-bool ensureWifi() {
-  if (wifiConnected && WiFi.status() == WL_CONNECTED) return true;
-
-  wifiConnected = false;
-  lcdPrint(" Connecting...", " WiFi...");
-  Serial.print(F("WIFI: Connecting..."));
-
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 24) {
-    delay(500);
-    Serial.print(".");
-    tries++;
-  }
-
-  wifiConnected = (WiFi.status() == WL_CONNECTED);
-
-  if (wifiConnected) {
-    Serial.println(F("\nWIFI: CONNECTED"));
-    Serial.print(F("IP: ")); Serial.println(WiFi.localIP());
-    if (!timeReady) syncNTP();
-    playSound(SND_WIFI_OK);
   } else {
-    Serial.println(F("\nWIFI: FAILED — offline mode"));
-    lcdPrint(" WiFi Failed", " Offline Mode");
+    lcdOffline();
+    delay(1500);
+  }
+
+  Serial.printf("[Boot] Ready — %d members  WiFi=%s\n",
+                memberCount, wifiAvailable?"YES":"NO");
+
+  for (int i=0;i<3;i++){setYellow(true);delay(120);setYellow(false);delay(120);}
+  lcdIdle();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MAIN LOOP
+// ─────────────────────────────────────────────────────────────────────────────
+void loop() {
+  unsigned long now = millis();
+
+  removeDayGrantsIfNewDay();
+
+  if (now - lastUpdatePoll >= UPDATE_INTERVAL) {
+    lastUpdatePoll = now;
+    if (WiFi.status()==WL_CONNECTED) {
+      pollCommands(); wifiAvailable=true; setWifiLed(true);
+    } else {
+      wifiAvailable = tryConnectWiFi();
+    }
+  }
+
+  if (now - lastStatusPost >= STATUS_INTERVAL) {
+    lastStatusPost = now;
+    if (WiFi.status()==WL_CONNECTED) postStatus();
+  }
+
+  if (now - lastIdleClock >= IDLE_CLOCK_INTERVAL) {
+    lastIdleClock = now;
+    lcdIdle();
+  }
+
+  char uid[12] = {0};
+  if (parseRFID(uid)) {
+    setYellow(true);
+    lcdScanning(uid);
+    processCard(uid);
+    setYellow(false);
     delay(1200);
-  }
-
-  return wifiConnected;
-}
-
-// ════════════════════════════════════════════════════════════
-// NON-BLOCKING WIFI CONNECTION
-// ════════════════════════════════════════════════════════════
-bool ensureWifiNonBlocking() {
-  if (wifiConnected && WiFi.status() == WL_CONNECTED) return true;
-
-  if (WiFi.status() != WL_CONNECTED && WiFi.status() != WL_NO_SHIELD) {
-    // Connection in progress
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiConnected = true;
-      Serial.println(F("\nWIFI: CONNECTED (non-blocking)"));
-      if (!timeReady) syncNTP();
-      playSound(SND_WIFI_OK);
-      return true;
-    }
-    return false;
-  }
-
-  // Start connection
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  return false;
-}
-
-// ════════════════════════════════════════════════════════════
-// NTP
-// ════════════════════════════════════════════════════════════
-void syncNTP() {
-  lastNtpAttempt = millis();
-  configTime(NTP_GMT_OFFSET_SEC, NTP_DAYLIGHT_OFFSET,
-             "pool.ntp.org", "time.nist.gov", "time.google.com");
-
-  Serial.print(F("NTP: Syncing"));
-  struct tm t;
-  int retries = 0;
-  while (!getLocalTime(&t, 1000) && retries < 10) {
-    Serial.print(".");
-    retries++;
-    delay(500);
-  }
-
-  if (getLocalTime(&t, 100)) {
-    timeReady  = true;
-    grantedDay = t.tm_yday;
-    blockedDay = t.tm_yday;
-    Serial.println(F("... OK"));
-    char buf[32];
-    strftime(buf, 32, "%H:%M:%S %d/%m/%Y", &t);
-    Serial.println(buf);
-  } else {
-    Serial.println(F(" FAILED (will retry)"));
+    while (rfidSerial.available()) rfidSerial.read();
+    lcdIdle();
   }
 }
 
-// ════════════════════════════════════════════════════════════
-// IDLE SCREEN
-// ════════════════════════════════════════════════════════════
-void showIdle() {
-  if (timeReady) {
-    struct tm t;
-    if (getLocalTime(&t, 100)) {
-      char timeBuf[17];
-      strftime(timeBuf, 17, "   %H:%M:%S", &t);
-      lcdPrint(" Ready to Scan", timeBuf);
-      return;
-    }
-  }
-  lcdPrint(" Ready to Scan", " No Clock Yet");
-}
+// ─────────────────────────────────────────────────────────────────────────────
+//  CARD PROCESSING
+// ─────────────────────────────────────────────────────────────────────────────
+void processCard(const char* uid) {
 
-// ════════════════════════════════════════════════════════════
-// TIME CHECK
-// ════════════════════════════════════════════════════════════
-bool isWithinAccessHours() {
-  if (SKIP_TIME_CHECK) return true;
-  if (!timeReady) return false;
-  struct tm t;
-  if (!getLocalTime(&t, 100)) return false;
-  int totalMin = t.tm_hour * 60 + t.tm_min;
-  return (totalMin >= ACCESS_HOUR_START * 60 &&
-          totalMin <  ACCESS_HOUR_END   * 60);
-}
+  // ── Online ────────────────────────────────────────────────────────────────
+  if (WiFi.status()==WL_CONNECTED) {
+    char sRole[20]={0}; bool dg=false;
+    if (checkScan(uid,sRole,&dg)) {
+      int idx=findMember(uid);
+      const char* nm=(idx>=0)?members[idx].name:uid;
 
-// ════════════════════════════════════════════════════════════
-// MIDNIGHT RESET
-// ════════════════════════════════════════════════════════════
-void checkMidnightReset() {
-  if (!timeReady) return;
-  struct tm t;
-  if (!getLocalTime(&t, 100)) return;
-
-  if (grantedDay != t.tm_yday) {
-    grantedCount = 0;
-    grantedDay   = t.tm_yday;
-    Serial.println(F("GRANT: midnight reset"));
-  }
-  if (blockedDay != t.tm_yday) {
-    blockedCount = 0;
-    blockedDay   = t.tm_yday;
-    Serial.println(F("BLOCK: midnight reset"));
-  }
-}
-
-// ════════════════════════════════════════════════════════════
-// DAY GRANT HELPERS
-// ════════════════════════════════════════════════════════════
-bool isGrantedToday(const char* uid) {
-  checkMidnightReset();
-  for (int i = 0; i < grantedCount; i++) {
-    if (strcmp(grantedUIDs[i], uid) == 0) return true;
-  }
-  return false;
-}
-
-void grantDayAccess(const char* uid) {
-  if (isGrantedToday(uid)) {
-    Serial.print(F("GRANT: already granted ")); Serial.println(uid);
-    return;
-  }
-  if (grantedCount >= GRANT_LIST_MAX) {
-    // Shift all entries up (remove oldest)
-    for (int i = 0; i < GRANT_LIST_MAX - 1; i++) {
-      strcpy(grantedUIDs[i], grantedUIDs[i + 1]);
-    }
-    grantedCount = GRANT_LIST_MAX - 1;
-  }
-  strncpy(grantedUIDs[grantedCount], uid, 10);
-  grantedUIDs[grantedCount][10] = '\0';
-  grantedCount++;
-  Serial.print(F("GRANT: day added ")); Serial.println(uid);
-}
-
-void revokeDayAccess(const char* uid) {
-  for (int i = 0; i < grantedCount; i++) {
-    if (strcmp(grantedUIDs[i], uid) == 0) {
-      // Shift remaining entries down
-      for (int j = i; j < grantedCount - 1; j++) {
-        strcpy(grantedUIDs[j], grantedUIDs[j + 1]);
+      if (strcmp(sRole,"banned")==0) {
+        denyAccess(uid,nm,sRole,"Banned");
+        postScan(uid,nm,"BANNED"); return;
       }
-      grantedCount--;
-      Serial.print(F("GRANT: day revoked ")); Serial.println(uid);
-      return;
+      if (dg) {
+        grantAccess(uid,nm,sRole,"Day grant");
+        postScan(uid,nm,"GRANTED_LEADER_DAY"); return;
+      }
+      if (is247Role(sRole)) {
+        const char* res=strcmp(sRole,"President")==0?"GRANTED_PRESIDENT":"GRANTED_BOARD";
+        grantAccess(uid,nm,sRole,"24/7 access");
+        postScan(uid,nm,res); return;
+      }
+      if (isTimeRole(sRole)) {
+        if (!inAccessWindow()) {
+          denyAccess(uid,nm,sRole,"Outside hours");
+          postScan(uid,nm,"DENIED_HOURS"); return;
+        }
+        grantAccess(uid,nm,sRole,"Within hours");
+        postScan(uid,nm,"GRANTED_LEADER"); return;
+      }
+      handleUnknownCard(uid,nm,sRole); return;
     }
+    handleUnknownCard(uid,uid,"unknown"); return;
   }
-}
 
-// ════════════════════════════════════════════════════════════
-// DAY BLOCK HELPERS
-// ════════════════════════════════════════════════════════════
-bool isBlockedToday(const char* uid) {
-  checkMidnightReset();
-  for (int i = 0; i < blockedCount; i++) {
-    if (strcmp(blockedUIDs[i], uid) == 0) return true;
+  // ── Offline ───────────────────────────────────────────────────────────────
+  int idx=findMember(uid);
+  if (idx<0) {
+    denyAccess(uid,uid,"unknown","Not in list");
+    setErrorLed(true); delay(1500); setErrorLed(false); return;
   }
-  return false;
-}
-
-void blockDayAccess(const char* uid) {
-  if (isBlockedToday(uid)) {
-    Serial.print(F("BLOCK: already blocked ")); Serial.println(uid);
-    return;
-  }
-  if (blockedCount >= BLOCK_LIST_MAX) {
-    for (int i = 0; i < BLOCK_LIST_MAX - 1; i++) {
-      strcpy(blockedUIDs[i], blockedUIDs[i + 1]);
+  Member& m=members[idx];
+  if (strcmp(m.role,"banned")==0)   { denyAccess(uid,m.name,m.role,"Banned"); return; }
+  if (strcmp(m.role,"pending")==0)  { denyAccess(uid,m.name,m.role,"Pending-no WiFi"); return; }
+  if (m.dayGrant) {
+    char today[11]; getToday(today);
+    if (today[0]!='\0' && strcmp(m.dayGrantDate,today)==0) {
+      grantAccess(uid,m.name,m.role,"Day grant"); return;
     }
-    blockedCount = BLOCK_LIST_MAX - 1;
+    m.dayGrant=false; m.dayGrantDate[0]='\0'; saveCSV();
   }
-  strncpy(blockedUIDs[blockedCount], uid, 10);
-  blockedUIDs[blockedCount][10] = '\0';
-  blockedCount++;
-  Serial.print(F("BLOCK: added ")); Serial.println(uid);
+  if (is247Role(m.role))  { grantAccess(uid,m.name,m.role,"24/7"); return; }
+  if (isTimeRole(m.role)) {
+    if (!inAccessWindow()) { denyAccess(uid,m.name,m.role,"Outside hours"); return; }
+    grantAccess(uid,m.name,m.role,"Offline OK"); return;
+  }
+  denyAccess(uid,m.name,m.role,"Unknown role");
 }
 
-// ════════════════════════════════════════════════════════════
-// RFID READ
-// ════════════════════════════════════════════════════════════
-unsigned long readUID() {
-  String data = "";
-  unsigned long start = millis();
-  while (millis() - start < 250) {
-    while (RFID_SERIAL.available()) {
-      char c = RFID_SERIAL.read();
-      if (isHexDigit(c)) data += c;
-    }
-  }
-  if (data.length() >= 10) {
-    String hexPart = data.substring(2, 10);
-    if (hexPart.length() == 8) {
-      char buf[9] = {0};
-      hexPart.toCharArray(buf, 9);
-      return strtoul(buf, NULL, 16);
-    }
-  }
-  return 0;
-}
+// ─────────────────────────────────────────────────────────────────────────────
+//  PENDING WINDOW
+// ─────────────────────────────────────────────────────────────────────────────
+void handleUnknownCard(const char* uid, const char* name, const char* role) {
+  Serial.printf("[Pending] %s — waiting 60s\n", uid);
 
-void flushRFID() {
-  while (RFID_SERIAL.available()) RFID_SERIAL.read();
-}
-
-String padUID(unsigned long uid) {
-  String s = String(uid);
-  while (s.length() < 10) s = "0" + s;
-  return s;
-}
-
-// ════════════════════════════════════════════════════════════
-// HTTP HELPERS
-// ════════════════════════════════════════════════════════════
-int httpPost(const String& url, const String& body) {
-  if (!wifiConnected) return -1;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-api-key", API_KEY);
-  http.setTimeout(5000);
-
-  int code = http.POST(body);
-  http.end();
-  return code;
-}
-
-int httpGet(const String& url, String& responseOut) {
-  if (!wifiConnected) return -1;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, url);
-  http.addHeader("x-api-key", API_KEY);
-  http.setTimeout(5000);
-
-  int code = http.GET();
-  if (code == 200) responseOut = http.getString();
-  http.end();
-  return code;
-}
-
-// ════════════════════════════════════════════════════════════
-// CHECK WITH SERVER (known members — Leaders)
-// ════════════════════════════════════════════════════════════
-String checkWithServer(const char* uid, const char* name) {
-  StaticJsonDocument<128> doc;
-  doc["uid"]  = uid;
-  doc["name"] = name;
-
-  String body;
-  serializeJson(doc, body);
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, buildURL("/discord/check/scan"));
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-api-key", API_KEY);
-  http.setTimeout(5000);
-
-  int code = http.POST(body);
-  if (code != 200) {
-    http.end();
-    Serial.printf("SERVER CHECK FAIL: %d\n", code);
-    return "";
+  if (WiFi.status()!=WL_CONNECTED) {
+    denyAccess(uid,name,role,"Unknown+no WiFi"); return;
   }
 
-  String resp = http.getString();
-  http.end();
+  unsigned long deadline = millis()+PENDING_TIMEOUT;
 
-  StaticJsonDocument<256> respDoc;
-  DeserializationError err = deserializeJson(respDoc, resp);
-  if (err) {
-    Serial.print(F("SERVER CHECK JSON ERR: ")); Serial.println(err.c_str());
-    return "";
-  }
+  while (millis()<deadline) {
+    lcdPending(deadline);
+    delay(POLL_INTERVAL_MS);
 
-  bool   known    = respDoc["known"]     | false;
-  String role     = respDoc["role"]      | "";
-  bool   dayGrant = respDoc["day_grant"] | false;
+    HTTPClient http;
+    http.begin(String(SERVER_URL)+"/discord/check/commands");
+    http.setTimeout(3000);
+    http.addHeader("x-api-key",API_KEY);
+    int code=http.GET();
 
-  Serial.printf("SERVER: known=%d role=%s dayGrant=%d\n",
-                known, role.c_str(), dayGrant);
+    if (code==200) {
+      DynamicJsonDocument doc(8192);
+      if (!deserializeJson(doc,http.getStream())) {
+        for (JsonObject cmd : doc["commands"].as<JsonArray>()) {
+          const char* id    =cmd["id"];
+          const char* action=cmd["action"];
+          const char* cuid  =cmd["uid"] |"";
+          const char* cname =cmd["name"]|"";
+          const char* crole =cmd["role"]|"";
 
-  if (!known)                    return "NOT_IN_LIST";
-  if (role == "banned")          return "BANNED";
-  if (role == "pending")         return "DENIED_PENDING";
-  if (role == "Exclusive board") return "GRANTED_BOARD";
-  if (role == "President")       return "GRANTED_PRESIDENT";
+          if (id&&id[0]) {
+            HTTPClient ack;
+            ack.begin(String(SERVER_URL)+"/discord/check/ack");
+            ack.setTimeout(2000);
+            ack.addHeader("Content-Type","application/json");
+            ack.addHeader("x-api-key",API_KEY);
+            StaticJsonDocument<128> ad; ad["id"]=id; ad["ok"]=true;
+            String ab; serializeJson(ad,ab);
+            ack.POST(ab); ack.end();
+          }
 
-  if (dayGrant)              return "GRANTED_LEADER_DAY";
-  if (isWithinAccessHours()) return "GRANTED_LEADER";
-  return "DENIED_HOURS";
-}
+          bool forUs=(strlen(cuid)==0||strcasecmp(cuid,uid)==0);
+          if (!forUs||!action) continue;
 
-// ════════════════════════════════════════════════════════════
-// ACCESS CHECK
-// ════════════════════════════════════════════════════════════
-void checkAccess(unsigned long uid) {
-  String uidStr = padUID(uid);
+          http.end(); setYellow(false);
 
-  // ── Early exit: blocked today ─────────────────────────────
-  if (isBlockedToday(uidStr.c_str())) {
-    accessDeniedBlocked("Unknown");
-    queueEvent(uidStr.c_str(), "Unknown", "DENIED_BLOCKED_DAY");
-    if (ensureWifi()) flushQueue();
-    return;
-  }
-
-  File f = LittleFS.open("/access.csv", "r");
-  if (!f) {
-    lcdPrint("  No access.csv", " Upload via IDE");
-    Serial.println(F("ERROR: /access.csv missing"));
-    playSound(SND_ERROR);
-    return;
-  }
-
-  bool found     = false;
-  bool firstLine = true;
-
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-
-    if (firstLine) {
-      firstLine = false;
-      if (line.startsWith("Full Name") || line.startsWith("full name")) continue;
-    }
-
-    int c1 = line.indexOf(',');           if (c1 == -1) continue;
-    int c2 = line.indexOf(',', c1 + 1);  if (c2 == -1) continue;
-
-    String name   = line.substring(0, c1);       name.trim();
-    String csvUID = line.substring(c1 + 1, c2);  csvUID.trim();
-    String role   = line.substring(c2 + 1);       role.trim();
-
-    unsigned long csvUIDLong = strtoul(csvUID.c_str(), NULL, 10);
-    String csvUIDPadded = padUID(csvUIDLong);
-
-    if (csvUIDPadded != uidStr) continue;
-
-    found = true;
-
-    // ── Exclusive Board: 100% local ───────────────────────
-    if (role == "Exclusive board") {
-      accessGrantedBoard(name);
-      queueEvent(uidStr.c_str(), name.c_str(), "GRANTED_BOARD");
-      if (ensureWifi()) flushQueue();
-
-    // ── President: 100% local ─────────────────────────────
-    } else if (role == "President") {
-      accessGrantedPresident(name);
-      queueEvent(uidStr.c_str(), name.c_str(), "GRANTED_PRESIDENT");
-      if (ensureWifi()) flushQueue();
-
-    // ── Leader: ask server first, local fallback ──────────
-    } else if (role == "Leader") {
-      lcdPrint(centerName(name), " Checking...");
-
-      if (ensureWifi()) {
-        String verdict = checkWithServer(uidStr.c_str(), name.c_str());
-
-        if (verdict == "GRANTED_LEADER") {
-          accessGrantedLeader(name, false);
-          sendToServer(uidStr.c_str(), name.c_str(), "GRANTED_LEADER");
-
-        } else if (verdict == "GRANTED_LEADER_DAY") {
-          accessGrantedLeader(name, true);
-          sendToServer(uidStr.c_str(), name.c_str(), "GRANTED_LEADER_DAY");
-
-        } else if (verdict == "DENIED_HOURS") {
-          accessDeniedHours(name);
-          sendToServer(uidStr.c_str(), name.c_str(), "DENIED_HOURS");
-
-        } else if (verdict == "BANNED") {
-          accessBanned(name);
-          sendToServer(uidStr.c_str(), name.c_str(), "BANNED");
-
-        } else if (verdict == "DENIED_PENDING") {
-          accessDenied(name, "Not Approved");
-          sendToServer(uidStr.c_str(), name.c_str(), "DENIED_PENDING");
-
-        } else {
-          // Server unreachable — local fallback
-          Serial.println(F("SERVER UNREACHABLE: local fallback"));
-          bool dayGrant = isGrantedToday(uidStr.c_str());
-          if (isWithinAccessHours() || dayGrant) {
-            const char* evtResult = dayGrant ? "GRANTED_LEADER_DAY" : "GRANTED_LEADER";
-            accessGrantedLeader(name, dayGrant);
-            queueEvent(uidStr.c_str(), name.c_str(), evtResult);
-            flushQueue();
-          } else {
-            accessDeniedHours(name);
-            queueEvent(uidStr.c_str(), name.c_str(), "DENIED_HOURS");
-            flushQueue();
+          if (strcmp(action,"open_door")==0) {
+            grantAccess(uid,name,role,"One-time (Discord)"); return;
+          }
+          if (strcmp(action,"grant_day")==0) {
+            char today[11]; getToday(today);
+            upsertMember(uid,cname[0]?cname:name,crole[0]?crole:role,true,today);
+            saveCSV();
+            grantAccess(uid,name,role,"Day grant (Discord)"); return;
+          }
+          if (strcmp(action,"deny")==0) {
+            denyAccess(uid,name,role,"Denied via Discord"); return;
+          }
+          if (strcmp(action,"ban")==0) {
+            upsertMember(uid,cname[0]?cname:name,"banned",false,"");
+            saveCSV();
+            denyAccess(uid,name,"banned","Banned via Discord"); return;
+          }
+          if (strcmp(action,"add_member")==0) {
+            upsertMember(uid,cname[0]?cname:name,crole[0]?crole:"Member",false,"");
+            saveCSV();
+            // Don't return — keep waiting for access command
           }
         }
-
-      } else {
-        // WiFi down — fully local
-        Serial.println(F("WIFI DOWN: local fallback for Leader"));
-        bool dayGrant = isGrantedToday(uidStr.c_str());
-        if (isWithinAccessHours() || dayGrant) {
-          const char* evtResult = dayGrant ? "GRANTED_LEADER_DAY" : "GRANTED_LEADER";
-          accessGrantedLeader(name, dayGrant);
-          queueEvent(uidStr.c_str(), name.c_str(), evtResult);
-        } else {
-          accessDeniedHours(name);
-          queueEvent(uidStr.c_str(), name.c_str(), "DENIED_HOURS");
-        }
       }
-
-    // ── Banned ────────────────────────────────────────────
-    } else if (role == "banned") {
-      accessBanned(name);
-      queueEvent(uidStr.c_str(), name.c_str(), "BANNED");
-      if (ensureWifi()) flushQueue();
-
-    } else {
-      accessDenied(name, "Invalid Role");
-      queueEvent(uidStr.c_str(), name.c_str(), "DENIED_ROLE");
-      if (ensureWifi()) flushQueue();
     }
-
-    break;
-  }
-  f.close();
-
-  // ════════════════════════════════════════════════════════
-  // UNKNOWN CARD FLOW - NON-BLOCKING
-  // ════════════════════════════════════════════════════════
-  if (!found) {
-    if (isBlockedToday(uidStr.c_str())) {
-      accessDeniedBlocked("Unknown");
-      queueEvent(uidStr.c_str(), "Unknown", "DENIED_BLOCKED_DAY");
-      if (ensureWifi()) flushQueue();
-      return;
-    }
-
-    accessUnknown(uid);
-    Serial.println(F("-> unknown card, starting non-blocking handler"));
-
-    // Start non-blocking unknown card handler
-    unknownState = UNKNOWN_WAITING_WIFI;
-    unknownStartTime = millis();
-    pendingUnknownUID = uidStr;
-    unknownScanTime = millis();
-
-    // Queue the NOT_IN_LIST event
-    queueEvent(uidStr.c_str(), "Unknown", "NOT_IN_LIST");
-  }
-}
-
-// ════════════════════════════════════════════════════════════
-// ACCESS OUTCOMES
-// ════════════════════════════════════════════════════════════
-void accessGrantedLeader(String name, bool dayGrant) {
-  String line2;
-  if (dayGrant) {
-    line2 = "Leader|Full Day";
-  } else if (timeReady) {
-    struct tm t;
-    if (getLocalTime(&t, 100)) {
-      char tb[6];
-      strftime(tb, 6, "%H:%M", &t);
-      line2 = "Leader | ";
-      line2 += tb;
-    } else {
-      line2 = "Leader | OK";
-    }
-  } else {
-    line2 = "Leader | OK";
-  }
-  lcdPrint(centerName(name), line2);
-  playSound(SND_GRANTED_LEADER);
-  openDoor();
-}
-
-void accessGrantedBoard(String name) {
-  lcdPrint(centerName(name), " Excl. Board *");
-  playSound(SND_GRANTED_BOARD);
-  openDoor();
-}
-
-void accessGrantedPresident(String name) {
-  lcdPrint(centerName(name), PRESIDENT_MSGS[presidentMsgIdx]);
-  presidentMsgIdx = (presidentMsgIdx + 1) % PRESIDENT_MSG_COUNT;
-  playSound(SND_GRANTED_PRESIDENT);
-  openDoor();
-}
-
-void accessBanned(String name) {
-  lcdPrint("!! BANNED !!", centerName(name));
-  playSound(SND_BANNED);
-}
-
-void accessDeniedHours(String name) {
-  lcdPrint(centerName(name), " 10AM-4PM Only");
-  playSound(SND_DENIED);
-}
-
-void accessDeniedBlocked(String name) {
-  lcdPrint("? Blocked Today", " Try Tomorrow");
-  playSound(SND_DENIED);
-}
-
-void accessUnknown(unsigned long uid) {
-  lcdPrint("? Unknown Card", padUID(uid));
-  playSound(SND_UNKNOWN);
-  delay(1000);
-  lcdPrint("? Connecting...", " Please wait");
-}
-
-void accessDenied(String name, const char* reason) {
-  lcdPrint(centerName(name), reason);
-  playSound(SND_DENIED);
-}
-
-void openDoor() {
-  digitalWrite(RELAY, HIGH);
-  delay(DOOR_OPEN_MS);
-  digitalWrite(RELAY, LOW);
-}
-
-// ════════════════════════════════════════════════════════════
-// SOUND ENGINE (Active Buzzer Only - ESP32-C3 compatible)
-// ════════════════════════════════════════════════════════════
-void playSound(int soundType) {
-  int times = 1;
-  int delayMs = 200;
-  
-  if (soundType == SND_BANNED || soundType == SND_ERROR)        times = 3;
-  else if (soundType == SND_UNKNOWN || soundType == SND_DENIED) times = 2;
-  else if (soundType == SND_GRANTED_PRESIDENT)                  times = 3;
-  else if (soundType == SND_WIFI_OK)                            times = 2;
-  
-  for (int i = 0; i < times; i++) {
-    digitalWrite(SIGNAL_PIN, HIGH);
-    delay(delayMs);
-    digitalWrite(SIGNAL_PIN, LOW);
-    if (i < times - 1) delay(150);
-  }
-  
-  // LED hold
-  digitalWrite(SIGNAL_PIN, HIGH);
-  delay(LED_HOLD_MS);
-  digitalWrite(SIGNAL_PIN, LOW);
-}
-
-// ════════════════════════════════════════════════════════════
-// EVENT QUEUE
-// ════════════════════════════════════════════════════════════
-void queueEvent(const char* uid, const char* name, const char* result) {
-  Serial.printf("EVENT: %s | %s | %s\n", uid, name, result);
-
-  if (queueCount >= QUEUE_MAX) {
-    memmove(&eventQueue[0], &eventQueue[1],
-            sizeof(QueueEntry) * (QUEUE_MAX - 1));
-    queueCount = QUEUE_MAX - 1;
-  }
-
-  strncpy(eventQueue[queueCount].uid,    uid,    10); eventQueue[queueCount].uid[10]    = '\0';
-  strncpy(eventQueue[queueCount].name,   name,   23); eventQueue[queueCount].name[23]   = '\0';
-  strncpy(eventQueue[queueCount].result, result, 27); eventQueue[queueCount].result[27] = '\0';
-  queueCount++;
-}
-
-// ════════════════════════════════════════════════════════════
-// SEND EVENT TO SERVER (single event, no queue)
-// ════════════════════════════════════════════════════════════
-bool sendToServer(const char* uid, const char* name, const char* result) {
-  StaticJsonDocument<256> doc;
-  doc["uid"]    = uid;
-  doc["name"]   = name;
-  doc["result"] = result;
-
-  String body;
-  serializeJson(doc, body);
-
-  int code = httpPost(buildURL("/discord/check"), body);
-  if (code < 200 || code >= 300) {
-    Serial.printf("SERVER ERR: %d\n", code);
-    wifiConnected = false;
-    return false;
-  }
-  return true;
-}
-
-// ════════════════════════════════════════════════════════════
-// SCAN UNKNOWN — server checks DB and notifies Discord
-// ════════════════════════════════════════════════════════════
-void scanUnknown(const char* uid) {
-  StaticJsonDocument<128> doc;
-  doc["uid"] = uid;
-
-  String body;
-  serializeJson(doc, body);
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, buildURL("/discord/check/scan"));
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-api-key", API_KEY);
-  http.setTimeout(5000);
-
-  int code = http.POST(body);
-  if (code != 200) {
     http.end();
-    Serial.printf("scanUnknown ERR: %d\n", code);
-    return;
   }
 
-  http.end();
-  Serial.println(F("scanUnknown: notification sent to Discord"));
+  setYellow(false);
+  denyAccess(uid,name,role,"Discord timeout");
 }
 
-// ════════════════════════════════════════════════════════════
-// FLUSH QUEUE (fixed - retry failed items)
-// ════════════════════════════════════════════════════════════
-void flushQueue() {
-  int i = 0;
-  while (i < queueCount && wifiConnected) {
-    bool ok = sendToServer(
-      eventQueue[i].uid,
-      eventQueue[i].name,
-      eventQueue[i].result
-    );
-    if (ok) {
-      // Remove this item by shifting remaining items
-      for (int j = i; j < queueCount - 1; j++) {
-        eventQueue[j] = eventQueue[j + 1];
-      }
-      queueCount--;
-      // Don't increment i - check the new item at same index
-    } else {
-      i++;  // Move to next item, this one will be retried later
+// ─────────────────────────────────────────────────────────────────────────────
+//  ACCESS ACTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+void grantAccess(const char* uid,const char* name,const char* role,const char* reason) {
+  Serial.printf("[GRANT] %s (%s) — %s\n",name,role,reason);
+  lcdGranted(name,role);
+  openDoor();
+  ledAccess(true,2000);
+  buzz(0);
+}
+void denyAccess(const char* uid,const char* name,const char* role,const char* reason) {
+  Serial.printf("[DENY]  %s (%s) — %s\n",name,role,reason);
+  lcdDenied(name,reason);
+  ledAccess(false,2000);
+  buzz(1);
+}
+void openDoor() {
+  Serial.println("[DOOR] Open");
+  digitalWrite(PIN_RELAY,HIGH); delay(500); digitalWrite(PIN_RELAY,LOW);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ROLE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+bool is247Role(const char* r) {
+  return strcmp(r,"President")==0||strcmp(r,"ExclusiveBoard")==0;
+}
+bool isTimeRole(const char* r) {
+  return strcmp(r,"Leader")==0||strcmp(r,"Member")==0;
+}
+const char* shortRole(const char* r) {
+  if (strcmp(r,"President")==0)      return "President";
+  if (strcmp(r,"ExclusiveBoard")==0) return "Excl.Board";
+  if (strcmp(r,"Leader")==0)         return "Leader";
+  if (strcmp(r,"Member")==0)         return "Member";
+  if (strcmp(r,"banned")==0)         return "BANNED";
+  return r;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LCD
+// ─────────────────────────────────────────────────────────────────────────────
+void lcdInit() {
+  lcd.init(); lcd.backlight();
+  lcd.createChar(0,CC_LOCK);
+  lcd.createChar(1,CC_UNLOCK);
+  lcd.createChar(2,CC_WIFI);
+  lcd.createChar(3,CC_BELL);
+  lcd.createChar(4,CC_PERSON);
+  lcd.createChar(5,CC_DOOR);
+}
+
+void lcdPrint16(int row,const char* text) {
+  lcd.setCursor(0,row);
+  char buf[17]; snprintf(buf,sizeof(buf),"%-16s",text); lcd.print(buf);
+}
+
+void lcdMsg(const char* l1,const char* l2) {
+  lcdPrint16(0,l1); lcdPrint16(1,l2);
+}
+
+void lcdScroll(int row,const char* text,int dly,int passes) {
+  int len=strlen(text);
+  if (len<=16) { lcdPrint16(row,text); return; }
+  for (int p=0;p<passes;p++) {
+    for (int off=0;off<=len-16;off++) {
+      lcd.setCursor(0,row);
+      for (int i=0;i<16;i++) lcd.print(text[off+i]);
+      delay(dly);
+    }
+    delay(dly*4);
+    for (int off=len-16;off>=0;off--) {
+      lcd.setCursor(0,row);
+      for (int i=0;i<16;i++) lcd.print(text[off+i]);
+      delay(dly/2);
     }
   }
 }
 
-// ════════════════════════════════════════════════════════════
-// POLL COMMANDS (background, every 5s)
-// ════════════════════════════════════════════════════════════
-void pollCommands() {
-  String payload;
-  int code = httpGet(buildURL("/discord/check/commands"), payload);
-
-  if (code != 200) {
-    if (code > 0) {
-      Serial.printf("POLL ERR: %d\n", code);
-      wifiConnected = false;
-    }
-    return;
-  }
-
-  DynamicJsonDocument doc(2048);
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    Serial.print(F("JSON parse err: ")); Serial.println(err.c_str());
-    return;
-  }
-
-  JsonArray commands = doc["commands"].as<JsonArray>();
-  for (JsonObject cmd : commands) {
-    String cmdId  = cmd["id"]     | "";
-    String action = cmd["action"] | "";
-    String uid    = cmd["uid"]    | "";
-    String name   = cmd["name"]   | "";
-    String role   = cmd["role"]   | "";
-    int    count  = cmd["count"]  | 10;
-
-    if (cmdId.length() == 0 || action.length() == 0) continue;
-
-    Serial.printf("CMD: %s -> %s\n", cmdId.c_str(), action.c_str());
-    bool ok = executeCommand(action, uid, name, role, count);
-    sendAck(cmdId, ok);
-  }
+void lcdAnimateBoot() {
+  lcd.clear();
+  // Type out title on row 0
+  const char* title = " RFID  ACCESS  ";
+  for (int i=0;i<15;i++) { lcd.setCursor(i,0); lcd.print(title[i]); delay(55); }
+  // Fill row 1 with lock icons
+  for (int i=0;i<16;i++) { lcd.setCursor(i,1); lcd.write((uint8_t)0); delay(35); }
+  delay(350);
+  // Clear row 1, write ready
+  lcdPrint16(1,"  System Ready  ");
+  delay(600);
 }
 
-// ════════════════════════════════════════════════════════════
-// COMMAND EXECUTOR (added revoke_day handler)
-// ════════════════════════════════════════════════════════════
-bool executeCommand(const String& action, const String& uid,
-                   const String& name, const String& role, int count) {
+void lcdIdle() {
+  struct tm t;
+  bool hasTime=getLocalTime(&t,50);
+  bool online=(WiFi.status()==WL_CONNECTED);
 
-  // ── grant_once: open door now, no memory saved ────────────
-  if (action == "grant_once") {
-    lcdPrint(" Bot: Once!", " Opening...");
-    playSound(SND_GRANTED_LEADER);
-    openDoor();
-    showIdle();
-    return true;
+  char row0[17],row1[17];
 
-  // ── grant_day: save to RAM, valid until midnight ──────────
-  } else if (action == "grant_day") {
-    grantDayAccess(uid.c_str());
-    lcdPrint(" Bot: Day Grant!", " Full Day Accs");
-    playSound(SND_GRANTED_LEADER);
-    delay(1500);
-    showIdle();
-    return true;
-
-  // ── revoke_day: remove from RAM grant list ─────────────────
-  } else if (action == "revoke_day") {
-    revokeDayAccess(uid.c_str());
-    lcdPrint(" Bot: Revoked!", " Day Access Removed");
-    delay(1500);
-    showIdle();
-    return true;
-
-  // ── block_day: block UID in RAM until midnight ────────────
-  } else if (action == "block_day") {
-    blockDayAccess(uid.c_str());
-    lcdPrint(" Bot: Blocked!", " Until Midnight");
-    delay(1500);
-    showIdle();
-    return true;
-
-  // ── open_door: remote open by bot command ─────────────────
-  } else if (action == "open_door") {
-    lcdPrint(" Remote Open!", " Bot Command");
-    playSound(SND_GRANTED_BOARD);
-    openDoor();
-    showIdle();
-    sendToServer("0000000000", "Remote", "GRANTED_REMOTE");
-    return true;
-
-  // ── add: add new member to CSV ───────────────────────────
-  } else if (action == "add" || action == "add_member") {
-    if (uid.length() > 0 && name.length() > 0 && role.length() > 0) {
-      return addToCSV(uid, name, role);
-    } else if (uid.length() > 0) {
-      // Add as Member if no role specified
-      return addToCSV(uid, "New Member", "Member");
-    }
-    return false;
-
-  // ── unban: restore to Leader ──────────────────────────────
-  } else if (action == "unban") {
-    return updateRoleInCSV(uid, "Leader");
-
-  // ── ban: write banned role to CSV ────────────────────────
-  } else if (action == "ban") {
-    return updateRoleInCSV(uid, "banned");
-
-  // ── get_status: report ESP health ─────────────────────────
-  } else if (action == "get_status") {
-    unsigned long uptimeMs = millis();
-    unsigned long upHr  = uptimeMs / 3600000;
-    unsigned long upMin = (uptimeMs % 3600000) / 60000;
-    unsigned long upSec = (uptimeMs % 60000) / 1000;
-
-    StaticJsonDocument<256> doc;
-    doc["uptime_h"]    = upHr;
-    doc["uptime_m"]    = upMin;
-    doc["uptime_s"]    = upSec;
-    doc["queue_count"] = queueCount;
-    doc["wifi_rssi"]   = WiFi.RSSI();
-    doc["free_heap"]   = ESP.getFreeHeap();
-    doc["time_ready"]  = timeReady;
-    doc["day_grants"]  = grantedCount;
-
-    String body;
-    serializeJson(doc, body);
-    int code = httpPost(buildURL("/discord/check/status-reply"), body);
-    return (code >= 200 && code < 300);
-
-  // ── get_report ────────────────────────────────────────────
-  } else if (action == "get_report") {
-    StaticJsonDocument<128> doc;
-    doc["queue_count"] = queueCount;
-    doc["free_heap"]   = ESP.getFreeHeap();
-    String body;
-    serializeJson(doc, body);
-    int code = httpPost(buildURL("/discord/check/report-reply"), body);
-    return (code >= 200 && code < 300);
+  if (hasTime) {
+    strftime(row0,sizeof(row0),"%H:%M  %d/%m/%y",&t);
+  } else {
+    // door icon + Scan card + lock icon
+    row0[0]=(char)5; row0[1]=' ';
+    strncpy(row0+2,"Scan your card",14); row0[16]='\0';
   }
 
+  // Row1: person icon + member count + WiFi or lock icon
+  snprintf(row1,sizeof(row1),"%c MB:%-3d  %s   ",
+           (char)4, memberCount, online?"Online":"Offln");
+  // Overwrite last char with wifi or lock icon
+  row1[15] = online ? (char)2 : (char)0;
+  row1[16] = '\0';
+
+  lcdPrint16(0,row0);
+  lcdPrint16(1,row1);
+}
+
+void lcdScanning(const char* uid) {
+  char row0[17]; row0[0]=(char)3; row0[1]=' ';
+  strncpy(row0+2,"Reading...    ",14); row0[16]='\0';
+  lcdPrint16(0,row0);
+  // UID on row1
+  char row1[17]; snprintf(row1,sizeof(row1),"%-16s",uid);
+  lcdPrint16(1,row1);
+}
+
+void lcdGranted(const char* name,const char* role) {
+  // Row0: unlock icon + "ACCESS GRANTED"
+  char row0[17]; row0[0]=(char)1; strncpy(row0+1," ACCESS GRANT! ",15); row0[16]='\0';
+  lcdPrint16(0,row0);
+  // Row1: role short
+  char row1[17]; snprintf(row1,sizeof(row1),"%-16s",shortRole(role));
+  lcdPrint16(1,row1);
+  delay(500);
+  // Row0: person icon + name (scroll if long)
+  char nameRow[33]; snprintf(nameRow,sizeof(nameRow),"%c %-30s",(char)4,name);
+  nameRow[32]='\0';
+  int nl=strlen(nameRow);
+  if (nl<=16) { lcdPrint16(0,nameRow); delay(1800); }
+  else lcdScroll(0,nameRow,220,1);
+}
+
+void lcdDenied(const char* name,const char* reason) {
+  char row0[17]; row0[0]=(char)0; strncpy(row0+1,"  ACCESS DENY  ",15); row0[16]='\0';
+  lcdPrint16(0,row0);
+  char row1[17]; snprintf(row1,sizeof(row1),"%-16s",reason);
+  lcdPrint16(1,row1);
+  delay(600);
+  // Show name briefly
+  char nameRow[17]; snprintf(nameRow,sizeof(nameRow),"%-16s",name);
+  lcdPrint16(1,nameRow);
+  delay(1600);
+}
+
+// Progress bar countdown — called in the 60s polling loop
+void lcdPending(unsigned long deadlineMs) {
+  unsigned long ms = (deadlineMs>millis())?(deadlineMs-millis()):0;
+  unsigned long secs = ms/1000;
+
+  char row0[17]; row0[0]=(char)3;
+  snprintf(row0+1,sizeof(row0)-1," Discord? %2lus  ",secs);
+  row0[16]='\0';
+  lcdPrint16(0,row0);
+
+  // 10-char shrinking bar
+  int filled=(int)(secs*10/(PENDING_TIMEOUT/1000));
+  if (filled>10) filled=10;
+  char row1[17];
+  for (int i=0;i<10;i++) row1[i]=(i<filled)?(char)0xFF:'.';
+  row1[10]=' '; row1[11]='W'; row1[12]='a'; row1[13]='i'; row1[14]='t'; row1[15]=' ';
+  row1[16]='\0';
+  lcdPrint16(1,row1);
+}
+
+void lcdWifiConnecting() {
+  char row0[17]; row0[0]=(char)2; strncpy(row0+1," Connecting... ",15); row0[16]='\0';
+  lcdMsg(row0,WIFI_SSID);
+}
+
+void lcdOffline() {
+  char row0[17]; row0[0]=(char)0; strncpy(row0+1,"  WiFi Failed  ",15); row0[16]='\0';
+  lcdMsg(row0," Offline  mode  ");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LED & BUZZER
+// ─────────────────────────────────────────────────────────────────────────────
+void ledAccess(bool granted,unsigned long ms) {
+  digitalWrite(PIN_LED_A_GREEN,granted?HIGH:LOW);
+  digitalWrite(PIN_LED_A_RED,!granted?HIGH:LOW);
+  delay(ms);
+  digitalWrite(PIN_LED_A_GREEN,LOW); digitalWrite(PIN_LED_A_RED,LOW);
+}
+void buzz(int p) {
+  switch(p) {
+    case 0: for(int i=0;i<2;i++){digitalWrite(PIN_BUZZER,HIGH);delay(90);digitalWrite(PIN_BUZZER,LOW);delay(90);} break;
+    case 1: digitalWrite(PIN_BUZZER,HIGH);delay(600);digitalWrite(PIN_BUZZER,LOW); break;
+    default:for(int i=0;i<3;i++){digitalWrite(PIN_BUZZER,HIGH);delay(70);digitalWrite(PIN_BUZZER,LOW);delay(70);}
+  }
+}
+void setWifiLed(bool on)  {digitalWrite(PIN_LED_WIFI,  on?HIGH:LOW);}
+void setErrorLed(bool on) {digitalWrite(PIN_LED_ERROR, on?HIGH:LOW);}
+void setYellow(bool on)   {digitalWrite(PIN_LED_YELLOW,on?HIGH:LOW);}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  RFID PARSER — RDM6300
+//
+//  Frame: STX [10 ASCII-hex bytes] [2 ASCII-hex XOR checksum] ETX  (14 bytes)
+//  Decoded into 5 raw bytes:  facility | B1 | B2 | B3 | CHK
+//  10-digit decimal UID = big-endian uint32 of raw[0..3]
+//  Checksum = raw[0] XOR raw[1] XOR raw[2] XOR raw[3]
+//
+//  UID format matches card sticker and DB seed values (e.g. "0007680714")
+// ─────────────────────────────────────────────────────────────────────────────
+static uint8_t h2n(uint8_t c) {
+  if(c>='0'&&c<='9') return c-'0';
+  if(c>='A'&&c<='F') return c-'A'+10;
+  if(c>='a'&&c<='f') return c-'a'+10;
+  return 0xFF;
+}
+
+bool parseRFID(char* uidOut) {
+  while (rfidSerial.available()) {
+    uint8_t b=rfidSerial.read();
+
+    if (b==RFID_STX) { rfidPos=0; rfidBuf[rfidPos++]=b; continue; }
+    if (rfidPos==0) continue;
+    if (rfidPos>=RFID_LEN) { rfidPos=0; continue; }
+    rfidBuf[rfidPos++]=b;
+    if (rfidPos<RFID_LEN) continue;
+
+    rfidPos=0;
+
+    if (rfidBuf[RFID_LEN-1]!=RFID_ETX) {
+      Serial.printf("[RFID] Bad ETX 0x%02X\n",rfidBuf[RFID_LEN-1]); continue;
+    }
+
+    bool ok=true;
+    for (int i=1;i<=10;i++) if(h2n(rfidBuf[i])==0xFF){ok=false;break;}
+    if (!ok) { Serial.println("[RFID] Bad hex"); continue; }
+
+    uint8_t raw[5];
+    for (int i=0;i<5;i++)
+      raw[i]=(h2n(rfidBuf[1+i*2])<<4)|h2n(rfidBuf[2+i*2]);
+
+    uint8_t chk=raw[0]^raw[1]^raw[2]^raw[3];
+    if (chk!=raw[4]) {
+      Serial.printf("[RFID] Chk fail: calc=%02X got=%02X | %02X %02X %02X %02X %02X\n",
+                    chk,raw[4],raw[0],raw[1],raw[2],raw[3],raw[4]);
+      Serial.print("[RFID] Frame: ");
+      for(int i=1;i<=12;i++) Serial.print((char)rfidBuf[i]);
+      Serial.println();
+      continue;
+    }
+
+    // 10-digit zero-padded decimal — matches DB seed UIDs
+    uint32_t num=((uint32_t)raw[0]<<24)|((uint32_t)raw[1]<<16)|
+                 ((uint32_t)raw[2]<<8)|(uint32_t)raw[3];
+    snprintf(uidOut,12,"%010lu",(unsigned long)num);
+    Serial.printf("[RFID] UID=%s  raw=%02X%02X%02X%02X  chk=%02X\n",
+                  uidOut,raw[0],raw[1],raw[2],raw[3],raw[4]);
+    return true;
+  }
   return false;
 }
 
-// ════════════════════════════════════════════════════════════
-// ACK
-// ════════════════════════════════════════════════════════════
-void sendAck(const String& cmdId, bool ok) {
-  if (!wifiConnected) return;
-
-  StaticJsonDocument<128> doc;
-  doc["id"] = cmdId;
-  doc["ok"] = ok;
-
-  String body;
-  serializeJson(doc, body);
-  httpPost(buildURL("/discord/check/ack"), body);
+// ─────────────────────────────────────────────────────────────────────────────
+//  MEMBER DATABASE
+// ─────────────────────────────────────────────────────────────────────────────
+int findMember(const char* uid) {
+  for (int i=0;i<memberCount;i++)
+    if(strcasecmp(members[i].uid,uid)==0) return i;
+  return -1;
+}
+void upsertMember(const char* uid,const char* name,const char* role,bool dg,const char* dgd) {
+  int idx=findMember(uid);
+  if (idx<0) {
+    if(memberCount>=MAX_MEMBERS){Serial.println("[DB] Full!");return;}
+    idx=memberCount++;
+    strncpy(members[idx].uid,uid,11); members[idx].uid[11]='\0';
+  }
+  Member& m=members[idx];
+  if(name&&name[0]){strncpy(m.name,name,32);m.name[32]='\0';}
+  if(role&&role[0]){strncpy(m.role,role,19);m.role[19]='\0';}
+  m.dayGrant=dg;
+  if(dgd){strncpy(m.dayGrantDate,dgd,10);m.dayGrantDate[10]='\0';}
 }
 
-// ════════════════════════════════════════════════════════════
-// CSV — UPDATE ROLE
-// ════════════════════════════════════════════════════════════
-bool updateRoleInCSV(const String& targetUID, const String& newRole) {
-  File src = LittleFS.open("/access.csv", "r");
-  File tmp = LittleFS.open("/tmp.csv",    "w");
-  if (!src || !tmp) return false;
-
-  bool found     = false;
-  bool firstLine = true;
-
-  while (src.available()) {
-    String line = src.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) { tmp.println(); continue; }
-
-    if (firstLine) {
-      firstLine = false;
-      if (line.startsWith("Full Name")) {
-        tmp.println(line);
-        continue;
-      }
-    }
-
-    int c1 = line.indexOf(',');
-    int c2 = line.indexOf(',', c1 + 1);
-    if (c1 == -1 || c2 == -1) { tmp.println(line); continue; }
-
-    String entryName = line.substring(0, c1);       entryName.trim();
-    String entryUID  = line.substring(c1 + 1, c2);  entryUID.trim();
-
-    unsigned long entryUIDLong  = strtoul(entryUID.c_str(),  NULL, 10);
-    unsigned long targetUIDLong = strtoul(targetUID.c_str(), NULL, 10);
-
-    if (entryUIDLong == targetUIDLong) {
-      tmp.print(entryName); tmp.print(",");
-      tmp.print(padUID(entryUIDLong)); tmp.print(",");
-      tmp.println(newRole);
-      found = true;
-    } else {
-      tmp.println(line);
-    }
-  }
-  src.close();
-  tmp.close();
-
-  LittleFS.remove("/access.csv");
-  LittleFS.rename("/tmp.csv", "/access.csv");
-
-  Serial.printf("ROLE_UPDATED: %s -> %s\n", targetUID.c_str(), newRole.c_str());
-  return found;
+void seedDefaults() {
+  for (int i=0;i<DEFAULTS_COUNT;i++)
+    upsertMember(DEFAULTS[i].uid,DEFAULTS[i].name,DEFAULTS[i].role,false,"");
+  saveCSV();
+  Serial.printf("[DB] Seeded %d defaults\n",DEFAULTS_COUNT);
 }
 
-// ════════════════════════════════════════════════════════════
-// CSV — ADD NEW MEMBER
-// ════════════════════════════════════════════════════════════
-bool addToCSV(const String& uid, const String& name, const String& role) {
-  if (uid.length() == 0 || name.length() == 0 || role.length() == 0) return false;
-
-  String uidPadded = padUID(strtoul(uid.c_str(), NULL, 10));
-  File check = LittleFS.open("/access.csv", "r");
-  if (check) {
-    while (check.available()) {
-      String line = check.readStringUntil('\n');
-      if (line.indexOf(uidPadded) != -1) {
-        check.close();
-        return updateRoleInCSV(uid, role);
-      }
-    }
-    check.close();
+// ─────────────────────────────────────────────────────────────────────────────
+//  CSV
+// ─────────────────────────────────────────────────────────────────────────────
+void loadCSV() {
+  memberCount=0;
+  File f=LittleFS.open(CSV_PATH,"r");
+  if (!f) { Serial.println("[CSV] No file — seeding"); seedDefaults(); return; }
+  while (f.available()&&memberCount<MAX_MEMBERS) {
+    String line=f.readStringUntil('\n'); line.trim();
+    if (!line.length()) continue;
+    char buf[128]; line.toCharArray(buf,sizeof(buf));
+    char uid[12],name[33],role[20],dgs[4],dgd[11];
+    char* tok=strtok(buf,",");
+    if(!tok) continue; strncpy(uid, tok,11);uid[11] ='\0';
+    tok=strtok(NULL,",");if(!tok)continue;strncpy(name,tok,32);name[32]='\0';
+    tok=strtok(NULL,",");if(!tok)continue;strncpy(role,tok,19);role[19]='\0';
+    tok=strtok(NULL,",");if(!tok)continue;strncpy(dgs, tok, 3);dgs[3]  ='\0';
+    tok=strtok(NULL,",");strncpy(dgd,tok?tok:"",10);dgd[10]='\0';
+    upsertMember(uid,name,role,atoi(dgs)==1,dgd);
   }
-
-  File f = LittleFS.open("/access.csv", "a");
-  if (!f) return false;
-  f.print(name);      f.print(",");
-  f.print(uidPadded); f.print(",");
-  f.println(role);
   f.close();
+  Serial.printf("[CSV] Loaded %d members\n",memberCount);
+  if (memberCount==0) { Serial.println("[CSV] Empty — seeding"); seedDefaults(); }
+}
 
-  Serial.printf("ADDED: %s uid=%s role=%s\n",
-                name.c_str(), uidPadded.c_str(), role.c_str());
+void saveCSV() {
+  File f=LittleFS.open(CSV_PATH,"w");
+  if (!f){Serial.println("[CSV] Write failed");return;}
+  for(int i=0;i<memberCount;i++)
+    f.printf("%s,%s,%s,%d,%s\n",
+      members[i].uid,members[i].name,members[i].role,
+      members[i].dayGrant?1:0,members[i].dayGrantDate);
+  f.close();
+  Serial.printf("[CSV] Saved %d members\n",memberCount);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MIDNIGHT RESET
+// ─────────────────────────────────────────────────────────────────────────────
+static char lastCheckedDate[11]="";
+void removeDayGrantsIfNewDay() {
+  char today[11]; getToday(today);
+  if(today[0]=='\0'||strcmp(today,lastCheckedDate)==0) return;
+  strncpy(lastCheckedDate,today,10);
+  bool ch=false;
+  for(int i=0;i<memberCount;i++)
+    if(members[i].dayGrant&&strcmp(members[i].dayGrantDate,today)!=0)
+      {members[i].dayGrant=false;members[i].dayGrantDate[0]='\0';ch=true;}
+  if(ch){saveCSV();Serial.println("[Day] Grants cleared");}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  HTTP
+// ─────────────────────────────────────────────────────────────────────────────
+bool postScan(const char* uid,const char* name,const char* result) {
+  int idx=findMember(uid);
+  const char* n=(idx>=0&&members[idx].name[0])?members[idx].name:name;
+  HTTPClient http;
+  http.begin(String(SERVER_URL)+"/discord/check");
+  http.setTimeout(3000);
+  http.addHeader("Content-Type","application/json");
+  http.addHeader("x-api-key",API_KEY);
+  StaticJsonDocument<256> doc;
+  doc["uid"]=uid;doc["name"]=n;doc["result"]=result;
+  String body;serializeJson(doc,body);
+  int code=http.POST(body); http.end(); return code==200;
+}
+
+bool checkScan(const char* uid,char* roleOut,bool* dgOut) {
+  HTTPClient http;
+  http.begin(String(SERVER_URL)+"/discord/check/scan");
+  http.setTimeout(4000);
+  http.addHeader("Content-Type","application/json");
+  http.addHeader("x-api-key",API_KEY);
+  StaticJsonDocument<128> req; req["uid"]=uid;
+  String body;serializeJson(req,body);
+  int code=http.POST(body);
+  if(code!=200){http.end();return false;}
+  DynamicJsonDocument res(512);
+  if(deserializeJson(res,http.getStream())){http.end();return false;}
+  http.end();
+  if(res["known"]|false){
+    strncpy(roleOut,res["role"]|"Member",19);
+    *dgOut=res["day_grant"]|false;
+    return true;
+  }
+  return false;
+}
+
+bool pollCommands() {
+  HTTPClient http;
+  http.begin(String(SERVER_URL)+"/discord/check/commands");
+  http.setTimeout(3000);
+  http.addHeader("x-api-key",API_KEY);
+  int code=http.GET();
+  if(code!=200){http.end();return false;}
+  DynamicJsonDocument doc(8192);
+  if(deserializeJson(doc,http.getStream())){http.end();return false;}
+  http.end();
+
+  bool changed=false;
+  for (JsonObject cmd:doc["commands"].as<JsonArray>()) {
+    const char* id    =cmd["id"];
+    const char* action=cmd["action"];
+    const char* uid   =cmd["uid"] |"";
+    const char* name  =cmd["name"]|"";
+    const char* role  =cmd["role"]|"";
+    if(!action) continue;
+    Serial.printf("[Cmd] %s uid=%s\n",action,uid);
+
+    if      (strcmp(action,"open_door")    ==0)          {openDoor();ledAccess(true,1200);buzz(0);}
+    else if (strcmp(action,"grant_day")    ==0&&uid[0])  {upsertMember(uid,name,role,true,"");changed=true;}
+    else if (strcmp(action,"revoke_day")   ==0&&uid[0])  {
+      int i=findMember(uid);
+      if(i>=0){members[i].dayGrant=false;members[i].dayGrantDate[0]='\0';changed=true;}
+    }
+    else if (strcmp(action,"add_member")   ==0&&uid[0])  {upsertMember(uid,name,role,false,"");changed=true;}
+    else if (strcmp(action,"update_member")==0&&uid[0])  {upsertMember(uid,name,role,false,"");changed=true;}
+    else if (strcmp(action,"ban")          ==0&&uid[0])  {upsertMember(uid,name,"banned",false,"");changed=true;}
+    else if (strcmp(action,"get_status")   ==0)          {postStatus();}
+
+    if(id&&id[0]){
+      HTTPClient ack;
+      ack.begin(String(SERVER_URL)+"/discord/check/ack");
+      ack.setTimeout(2000);
+      ack.addHeader("Content-Type","application/json");
+      ack.addHeader("x-api-key",API_KEY);
+      StaticJsonDocument<128> ad;ad["id"]=id;ad["ok"]=true;
+      String ab;serializeJson(ad,ab);
+      ack.POST(ab);ack.end();
+    }
+  }
+  if(changed) saveCSV();
   return true;
 }
 
-// ════════════════════════════════════════════════════════════
-// LCD HELPERS
-// ════════════════════════════════════════════════════════════
-String centerName(String name) {
-  if (name.length() >= 16) return name.substring(0, 16);
-  int pad = (16 - name.length()) / 2;
-  String out = "";
-  for (int i = 0; i < pad; i++) out += " ";
-  out += name;
-  return out;
+void postStatus() {
+  HTTPClient http;
+  http.begin(String(SERVER_URL)+"/discord/check/status-reply");
+  http.setTimeout(3000);
+  http.addHeader("Content-Type","application/json");
+  http.addHeader("x-api-key",API_KEY);
+  char tb[20]="No NTP"; struct tm t;
+  if(getLocalTime(&t)) strftime(tb,sizeof(tb),"%H:%M %d/%m/%y",&t);
+  StaticJsonDocument<256> doc;
+  doc["uptime"]=String((millis()-bootMillis)/1000)+"s";
+  doc["rssi"]=WiFi.RSSI();
+  doc["memberCount"]=memberCount;
+  doc["ip"]=WiFi.localIP().toString();
+  doc["freeHeap"]=ESP.getFreeHeap();
+  doc["lcd"]=tb;
+  String body;serializeJson(doc,body);
+  http.POST(body);http.end();
 }
 
-void lcdPrint(const char* l1, const char* l2) {
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print(l1);
-  lcd.setCursor(0, 1); lcd.print(l2);
+// ─────────────────────────────────────────────────────────────────────────────
+//  WIFI — quick non-blocking attempt (5 s max)
+// ─────────────────────────────────────────────────────────────────────────────
+bool tryConnectWiFi() {
+  if(WiFi.status()==WL_CONNECTED){setWifiLed(true);return true;}
+  Serial.print("[WiFi] Trying");
+  WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+  for(int i=0;i<10;i++){
+    delay(500);Serial.print(".");setWifiLed(i%2);
+    if(WiFi.status()==WL_CONNECTED) break;
+  }
+  if(WiFi.status()==WL_CONNECTED){
+    Serial.printf(" OK %s\n",WiFi.localIP().toString().c_str());
+    setWifiLed(true);setErrorLed(false);return true;
+  }
+  Serial.println(" failed");
+  setWifiLed(false);setErrorLed(true);return false;
 }
 
-void lcdPrint(String l1, String l2) {
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print(l1.substring(0, 16));
-  lcd.setCursor(0, 1); lcd.print(l2.substring(0, 16));
+// ─────────────────────────────────────────────────────────────────────────────
+//  TIME
+// ─────────────────────────────────────────────────────────────────────────────
+void getToday(char* out){
+  struct tm t;
+  if(!getLocalTime(&t,100)){out[0]='\0';return;}
+  strftime(out,11,"%Y-%m-%d",&t);
+}
+int currentHour(){
+  struct tm t;
+  if(!getLocalTime(&t,100)) return -1;
+  return t.tm_hour;
+}
+bool inAccessWindow(){
+  int h=currentHour();
+  if(h<0) return true;  // no NTP yet — allow (offline safe)
+  return h>=ACCESS_HOUR_START&&h<ACCESS_HOUR_END;
 }
