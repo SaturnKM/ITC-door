@@ -1,0 +1,4 @@
+node_modules/
+.env
+start bot.cmd
+hosts.txt
