@@ -104,12 +104,16 @@ function loadMembers() {
   try {
     if (fs.existsSync(MEMBERS_FILE)) {
       db = parseMembersCSV(fs.readFileSync(MEMBERS_FILE, 'utf8'));
-      if (db.length > 0) { console.log(`[DB] Loaded ${db.length} members`); return; }
+      console.log(`[DB] Loaded ${db.length} members from members.csv`);
+      return;
     }
     if (fs.existsSync(MEMBERS_BACKUP)) {
       db = parseMembersCSV(fs.readFileSync(MEMBERS_BACKUP, 'utf8'));
-      if (db.length > 0) { console.log(`[DB] Loaded ${db.length} from backup`); saveMembers(); return; }
+      console.log(`[DB] Loaded ${db.length} members from backup`);
+      saveMembers();
+      return;
     }
+    // Only use defaults if both CSV files are missing or unreadable
     console.log('[DB] No CSV found — loading defaults');
     db = DEFAULTS.map(d => ({ ...d, uid: normalizeUID(d.uid), banned: false, dayGrant: false, dayGrantDate: 0 }));
     saveMembers();
