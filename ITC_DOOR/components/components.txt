@@ -1,0 +1,13 @@
+1 = pcb0 "5x7 is enough" I USED 9x15 AND CUT IT 
+1 = ESP32 super mini C3
+1 = RDM6300 
+1 = BUZZER
+1 = 2n2222 npn transistor
+1 = diode in4007
+2 = connector
+3 = RESISTANCE 200 ~ 240
+some male/male connectors
+some male/female connectors
+6 = jumper wires female/female
+
+soldering material ans some wires
