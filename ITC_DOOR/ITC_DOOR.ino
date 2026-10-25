@@ -15,15 +15,15 @@
 // ============================================================
 
 // ---- USER CONFIG --------------------------------------------
-#define WIFI_SSID              "DOOR_ACCESS" // badel 3la 7sab wifi ta3 local
-#define WIFI_PASSWORD          "DOOR_ACCESS" // badel 3la 7sab password ta3 local
+#define WIFI_SSID              "DOOR_ACCESS"
+#define WIFI_PASSWORD          "DOOR_ACCESS"
 
-#define SERVER_URL             "ITCDOOR.duckdns.org" // badel 3la 7sab dns
-#define SERVER_PORT            3000 // chouf l port ta3 server ta3k 
-#define USE_HTTPS              false // ida kan https dirou true /else false
+#define SERVER_URL             "yourdns.duckdns.org"
+#define SERVER_PORT            3000 // change to used port
+#define USE_HTTPS              false // if https is used make it true /else false
 
-#define API_KEY                "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+" // touch it and you are dead
-#define TIMEZONE_STR           "CET-1CEST,M3.5.0,M10.5.0/3" // je pense ta3 alger
+#define API_KEY                "your token"
+#define TIMEZONE_STR           "CET-1CEST,M3.5.0,M10.5.0/3" // algeria
 #define DISABLE_TIME_RULES     true
 
 // ---- PIN DEFINITIONS ----------------------------------------
