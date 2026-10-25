@@ -1,6 +1,5 @@
 // ============================================================
 //  commands.js — Slash command definitions & handlers
-//  File 2/4  |  RFID Access Control Bot
 // ============================================================
 'use strict';
 
@@ -15,6 +14,7 @@ const api     = require('./api');
 
 // ─── VALID ROLES ─────────────────────────────────────────────
 const VALID_ROLES = ['President', 'ExclusiveBoard', 'Leader', 'Member', 'Pending', 'Banned'];
+const ASSIGNABLE_ROLES = ['President', 'ExclusiveBoard', 'Leader', 'Member'];
 
 // ─── ROLE META ───────────────────────────────────────────────
 const ROLE_META = {
@@ -46,25 +46,17 @@ function memberEmbed(m, title) {
 // ─── RESPOND HELPER ──────────────────────────────────────────
 async function respond(interaction, payload) {
   try {
-    if (interaction.deferred) return await interaction.editReply(payload);
-    if (interaction.replied)  return;
+    if (interaction.deferred) {
+      return await interaction.editReply(payload);
+    }
+    if (interaction.replied) {
+      return;
+    }
     return await interaction.reply(payload);
   } catch (e) {
     if (e.code === 10062 || e.code === 40060) return;
     console.error('[CMD] respond() unexpected error:', e.message);
   }
-}
-
-// ─── NAME-OR-UID LOOKUP HELPER ───────────────────────────────
-// Tries UID first, then name. Returns { m, err } where err is a
-// ready-to-send error string if the lookup failed.
-function resolveTarget(input) {
-  let m = storage.findByUID(input);
-  if (m) return { m, err: null };
-  const byName = storage.findByName(input);
-  if (byName.length === 1)  return { m: byName[0], err: null };
-  if (byName.length  >  1)  return { m: null, err: `❌ Multiple members match **"${input}"** — use the UID instead.` };
-  return { m: null, err: `❌ Member not found: \`${input}\`` };
 }
 
 // ─── COMMAND DEFINITIONS ─────────────────────────────────────
@@ -76,55 +68,51 @@ const commandDefs = [
     .addStringOption(o => o.setName('name').setDescription('Full name').setRequired(true))
     .addStringOption(o => o.setName('uid').setDescription('10-digit RFID UID').setRequired(true))
     .addStringOption(o => o.setName('role').setDescription('Role (default: Member)').setRequired(false)
-      .addChoices(...VALID_ROLES.map(r => ({ name: r, value: r })))),
+      .addChoices(...ASSIGNABLE_ROLES.map(r => ({ name: r, value: r })))),
 
   new SlashCommandBuilder()
     .setName('ban')
     .setDescription('Ban a member permanently')
-    .addStringOption(o => o.setName('uid').setDescription('RFID UID or Name').setRequired(true)),
+    .addStringOption(o => o.setName('uid').setDescription('RFID UID').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('unban')
     .setDescription('Unban a member and restore their role')
-    .addStringOption(o => o.setName('uid').setDescription('RFID UID or Name').setRequired(true))
-    .addStringOption(o => o.setName('role').setDescription('Role to restore (default: Leader)').setRequired(false)
-      .addChoices(...VALID_ROLES.filter(r => r !== 'Banned').map(r => ({ name: r, value: r })))),
+    .addStringOption(o => o.setName('uid').setDescription('RFID UID').setRequired(true))
+    .addStringOption(o => o.setName('role').setDescription('Role to restore (default: Member)').setRequired(false)
+      .addChoices(...ASSIGNABLE_ROLES.map(r => ({ name: r, value: r })))),
 
   new SlashCommandBuilder()
     .setName('grant_day')
     .setDescription('Grant a Leader/Member access for today only')
-    .addStringOption(o => o.setName('uid').setDescription('RFID UID or Name').setRequired(true)),
+    .addStringOption(o => o.setName('uid').setDescription('RFID UID').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('revoke_day')
-    .setDescription('Revoke a day grant (member must have one active)')
+    .setDescription('Revoke a day grant')
     .addStringOption(o => o.setName('uid').setDescription('RFID UID or Name').setRequired(true)),
 
-  // FIX: /revoke_access now also sets the role to Pending so the ESP forces
-  // Discord approval on the next scan, even if there was no day grant to clear.
-  // This handles the "Access Once was granted but we want to block further scans"
-  // case — previously it would say "no active temporary access" and do nothing.
   new SlashCommandBuilder()
     .setName('revoke_access')
-    .setDescription('Block further scans today — revokes day grant and requires Discord approval on next scan')
+    .setDescription('Revoke all temporary access for a member')
     .addStringOption(o => o.setName('uid').setDescription('RFID UID or Name').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('open_door')
-    .setDescription('Remotely open the door for 5 seconds'),
+    .setDescription('Remotely open the door for 8 seconds'),
 
   new SlashCommandBuilder()
     .setName('setrole')
     .setDescription('Change a member\'s role')
-    .addStringOption(o => o.setName('uid').setDescription('RFID UID or Name').setRequired(true))
+    .addStringOption(o => o.setName('uid').setDescription('RFID UID').setRequired(true))
     .addStringOption(o => o.setName('role').setDescription('New role').setRequired(true)
-      .addChoices(...VALID_ROLES.map(r => ({ name: r, value: r }))))
+      .addChoices(...ASSIGNABLE_ROLES.map(r => ({ name: r, value: r }))))
     .addStringOption(o => o.setName('name').setDescription('Also update name (optional)').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('rename')
     .setDescription('Rename a member')
-    .addStringOption(o => o.setName('uid').setDescription('RFID UID or Name').setRequired(true))
+    .addStringOption(o => o.setName('uid').setDescription('RFID UID').setRequired(true))
     .addStringOption(o => o.setName('name').setDescription('New name').setRequired(true)),
 
   new SlashCommandBuilder()
@@ -184,11 +172,12 @@ async function handleCommand(interaction) {
   try {
     switch (commandName) {
 
-      // ── /add ───────────────────────────────────────────────
       case 'add': {
         const name    = interaction.options.getString('name');
         const uid     = interaction.options.getString('uid').trim();
         const role    = interaction.options.getString('role') || 'Member';
+        if (!ASSIGNABLE_ROLES.includes(role))
+          return interaction.editReply(`❌ Invalid role **${role}**.`);
         const normUID = uid.length <= 10 ? uid.padStart(10, '0') : uid;
         const res     = storage.addMember(name, normUID, role);
         if (!res.ok) return interaction.editReply(`❌ ${res.reason}`);
@@ -196,29 +185,18 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /ban ───────────────────────────────────────────────
       case 'ban': {
-        const input = interaction.options.getString('uid').trim();
-        // Try by UID first; if that fails, resolve by name
-        let uid = input;
-        if (!storage.findByUID(input)) {
-          const { m, err } = resolveTarget(input);
-          if (err) return interaction.editReply(err);
-          uid = m.uid;
-        }
+        const uid = interaction.options.getString('uid').trim();
         const res = storage.banMember(uid);
         if (!res.ok) return interaction.editReply(`❌ ${res.reason}`);
         await interaction.editReply({ embeds: [memberEmbed(res.member, `🔨 Banned: ${res.member.name}`)] });
         break;
       }
 
-      // ── /unban ─────────────────────────────────────────────
       case 'unban': {
-        const input       = interaction.options.getString('uid').trim();
-        const restoreRole = interaction.options.getString('role') || 'Leader';
-        const { m, err }  = resolveTarget(input);
-        if (err) return interaction.editReply(err);
-        const res = storage.unbanMember(m.uid, restoreRole);
+        const uid         = interaction.options.getString('uid').trim();
+        const restoreRole = interaction.options.getString('role') || 'Member';
+        const res         = storage.unbanMember(uid, restoreRole);
         if (!res.ok) return interaction.editReply(`❌ ${res.reason}`);
         await interaction.editReply({
           embeds: [memberEmbed(res.member, `✅ Unbanned: ${res.member.name} → restored as **${restoreRole}**`)],
@@ -226,29 +204,24 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /grant_day ─────────────────────────────────────────
       case 'grant_day': {
-        const input      = interaction.options.getString('uid').trim();
-        const { m, err } = resolveTarget(input);
-        if (err) return interaction.editReply(err);
-        // If the member is Pending, restore their real role first so grantDay() passes the role check.
-        // Pending members have their real role stored as Leader/Member before being set to Pending.
-        // We default to Leader since that's the most common escalated role in this club.
-        if (m.role === 'Pending') {
-          storage.setRole(m.uid, 'Leader');
-        }
-        const fresh = storage.findByUID(m.uid);
-        const res   = storage.grantDay(fresh.uid);
+        const uid = interaction.options.getString('uid').trim();
+        const res = storage.grantDay(uid);
         if (!res.ok) return interaction.editReply(`❌ ${res.reason}`);
         await interaction.editReply({ embeds: [memberEmbed(res.member, `📅 Day grant: ${res.member.name}`)] });
         break;
       }
 
-      // ── /revoke_day ────────────────────────────────────────
       case 'revoke_day': {
-        const input      = interaction.options.getString('uid').trim();
-        const { m, err } = resolveTarget(input);
-        if (err) return interaction.editReply(err);
+        const input = interaction.options.getString('uid').trim();
+        let m = storage.findByUID(input);
+        if (!m) {
+          const byName = storage.findByName(input);
+          if (byName.length === 1) m = byName[0];
+          else if (byName.length > 1)
+            return interaction.editReply(`❌ Multiple members match "${input}" — use UID instead.`);
+        }
+        if (!m) return interaction.editReply(`❌ Member not found: \`${input}\``);
         if (!m.dayGrant) return interaction.editReply(`ℹ️ **${m.name}** has no active day grant.`);
         const res = storage.revokeDay(m.uid);
         if (!res.ok) return interaction.editReply(`❌ ${res.reason}`);
@@ -256,47 +229,25 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /revoke_access ─────────────────────────────────────
-      // FIX: The old version only checked m.dayGrant and Pending/Banned role,
-      // so if a member used "Access Once" (no day grant stored) it would say
-      // "no active temporary access" and do nothing — leaving them free to
-      // scan again immediately and get another pending request.
-      //
-      // New behaviour:
-      //   1. Revoke any active day grant (if present).
-      //   2. Set role to "Pending" regardless of current state (unless already Banned).
-      //      This forces the ESP to escalate to Discord on the next scan, giving
-      //      admins full control over whether to let them in again.
-      //   3. Queue the update so the ESP receives it within 30 s.
-      //
-      // To undo: use /grant_day (which also clears Pending and restores Leader)
-      //          or /setrole to manually restore their role.
       case 'revoke_access': {
-        const input      = interaction.options.getString('uid').trim();
-        const { m, err } = resolveTarget(input);
-        if (err) return interaction.editReply(err);
-
-        if (m.banned) {
-          return interaction.editReply(`ℹ️ **${m.name}** is already banned — use \`/unban\` to manage them.`);
+        const input = interaction.options.getString('uid').trim();
+        let m = storage.findByUID(input);
+        if (!m) {
+          const byName = storage.findByName(input);
+          if (byName.length === 1) m = byName[0];
+          else if (byName.length > 1)
+            return interaction.editReply(`❌ Multiple members match "${input}" — use UID instead.`);
         }
-
-        // Revoke day grant if present
-        if (m.dayGrant) storage.revokeDay(m.uid);
-
-        // Set to Pending so ESP forces Discord approval on next scan
-        // (skip if already Pending — nothing to change on the role)
-        if (m.role !== 'Pending') {
-          storage.setRole(m.uid, 'Pending');
-        }
-
+        if (!m) return interaction.editReply(`❌ Member not found: \`${input}\``);
+        let changed = false;
+        if (m.dayGrant) { storage.revokeDay(m.uid); changed = true; }
+        if (['Pending', 'Banned'].includes(m.role)) { storage.setRole(m.uid, 'Member'); changed = true; }
+        if (!changed) return interaction.editReply(`ℹ️ **${m.name}** has no active temporary access.`);
         const updated = storage.findByUID(m.uid);
-        const embed   = memberEmbed(updated, `🔒 Access blocked: ${updated.name}`)
-          .setDescription('Role set to **Pending** — next scan will require Discord approval.\nUse `/grant_day` or `/setrole` to restore access.');
-        await interaction.editReply({ embeds: [embed] });
+        await interaction.editReply({ embeds: [memberEmbed(updated, `🔒 Access revoked: ${updated.name}`)] });
         break;
       }
 
-      // ── /open_door ─────────────────────────────────────────
       case 'open_door': {
         api.queueDoorCommand('open_door');
         await respond(interaction, {
@@ -306,40 +257,33 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /setrole ───────────────────────────────────────────
       case 'setrole': {
-        const input   = interaction.options.getString('uid').trim();
+        const uid     = interaction.options.getString('uid').trim();
         const role    = interaction.options.getString('role');
         const newName = interaction.options.getString('name');
-        const { m, err } = resolveTarget(input);
-        if (err) return interaction.editReply(err);
 
         if (newName) {
-          const renameRes = storage.renameMember(m.uid, newName);
+          const renameRes = storage.renameMember(uid, newName);
           if (!renameRes.ok) return interaction.editReply(`❌ Rename failed: ${renameRes.reason}`);
         }
 
-        const res = storage.setRole(m.uid, role);
+        const res = storage.setRole(uid, role);
         if (!res.ok) return interaction.editReply(`❌ ${res.reason}`);
 
-        const updated = storage.findByUID(m.uid);
+        const updated = storage.findByUID(uid);
         await interaction.editReply({ embeds: [memberEmbed(updated, `🔄 Role updated: ${updated.name}`)] });
         break;
       }
 
-      // ── /rename ────────────────────────────────────────────
       case 'rename': {
-        const input      = interaction.options.getString('uid').trim();
-        const name       = interaction.options.getString('name');
-        const { m, err } = resolveTarget(input);
-        if (err) return interaction.editReply(err);
-        const res = storage.renameMember(m.uid, name);
+        const uid  = interaction.options.getString('uid').trim();
+        const name = interaction.options.getString('name');
+        const res  = storage.renameMember(uid, name);
         if (!res.ok) return interaction.editReply(`❌ ${res.reason}`);
-        await interaction.editReply(`✅ Renamed **${m.name}** → **${name}**.`);
+        await interaction.editReply(`✅ Renamed to **${name}**.`);
         break;
       }
 
-      // ── /list ──────────────────────────────────────────────
       case 'list': {
         const roleFilter = interaction.options.getString('role');
         const allMembers = storage.getAllMembers();
@@ -388,7 +332,6 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /pending ───────────────────────────────────────────
       case 'pending': {
         const p = api.getActivePending();
         if (!p) {
@@ -410,7 +353,6 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /log ───────────────────────────────────────────────
       case 'log': {
         const n    = Math.min(interaction.options.getInteger('n') || 20, 50);
         const logs = storage.getRecentLogs(n);
@@ -436,7 +378,6 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /report ────────────────────────────────────────────
       case 'report': {
         const all     = storage.getAllMembers();
         const logs    = storage.getRecentLogs(500);
@@ -446,17 +387,15 @@ async function handleCommand(interaction) {
         const denied  = logs.filter(l => l.event === 'denied').length;
         const banned  = all.filter(m => m.banned).length;
         const dayG    = all.filter(m => m.dayGrant).length;
-        const pending = all.filter(m => m.role === 'Pending' && !m.banned).length;
         const embed   = new EmbedBuilder()
           .setColor(0x1ABC9C)
           .setTitle('📊 Access Control Report')
           .addFields(
-            { name: 'Total Members',     value: String(all.length),  inline: true },
-            { name: '🔴 Banned',         value: String(banned),      inline: true },
-            { name: '⏳ Pending',         value: String(pending),     inline: true },
-            { name: '📅 Day Grants',     value: String(dayG),        inline: true },
-            { name: '✅ Granted',        value: String(granted),     inline: true },
-            { name: '🚫 Denied',         value: String(denied),      inline: true },
+            { name: 'Total Members',     value: String(all.length), inline: true },
+            { name: '🔴 Banned',         value: String(banned),     inline: true },
+            { name: '📅 Day Grants',     value: String(dayG),       inline: true },
+            { name: '✅ Granted',        value: String(granted),    inline: true },
+            { name: '🚫 Denied',         value: String(denied),     inline: true },
             { name: 'Role Breakdown',
               value: Object.entries(byRole)
                 .map(([r, n]) => `${(ROLE_META[r]||{}).emoji||'•'} ${r}: ${n}`)
@@ -468,27 +407,24 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /status ────────────────────────────────────────────
       case 'status': {
         const allMembers  = storage.getAllMembers();
         const bannedCount = allMembers.filter(m => m.banned).length;
         const dayGCount   = allMembers.filter(m => m.dayGrant).length;
-        const pendingBlocked = allMembers.filter(m => m.role === 'Pending' && !m.banned).length;
         const pending     = api.getActivePending();
         const queueItems  = storage.peekQueue();
         const embed       = new EmbedBuilder()
           .setColor(0x2ECC71)
           .setTitle('🟢 System Status')
           .addFields(
-            { name: '🤖 Bot',            value: '✅ Online',                    inline: true },
-            { name: '⏱ Uptime',          value: formatUptime(process.uptime()), inline: true },
-            { name: '🕐 Server Time',     value: new Date().toLocaleString(),    inline: true },
-            { name: '👥 Total Members',   value: String(allMembers.length),     inline: true },
-            { name: '🔴 Banned',          value: String(bannedCount),           inline: true },
-            { name: '📅 Day Grants',      value: String(dayGCount),             inline: true },
-            { name: '⏳ Blocked/Pending', value: String(pendingBlocked),        inline: true },
-            { name: '📡 Sync Queue',      value: `${queueItems.length} pending`,inline: true },
-            { name: '🔔 Active Request',  value: pending
+            { name: '🤖 Bot',           value: '✅ Online',                    inline: true },
+            { name: '⏱ Uptime',         value: formatUptime(process.uptime()), inline: true },
+            { name: '🕐 Server Time',    value: new Date().toLocaleString(),    inline: true },
+            { name: '👥 Total Members',  value: String(allMembers.length),     inline: true },
+            { name: '🔴 Banned',         value: String(bannedCount),           inline: true },
+            { name: '📅 Day Grants',     value: String(dayGCount),             inline: true },
+            { name: '📡 Sync Queue',     value: `${queueItems.length} pending`,inline: true },
+            { name: '⏳ Pending',        value: pending
                 ? `UID \`${pending.uid}\` — ${Math.floor((Date.now()-pending.createdAt)/1000)}s ago`
                 : 'None', inline: true },
           )
@@ -498,7 +434,6 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /sync ──────────────────────────────────────────────
       case 'sync': {
         const all = storage.getAllMembers();
         for (const m of all) storage.queueUpdate(m);
@@ -509,40 +444,32 @@ async function handleCommand(interaction) {
         break;
       }
 
-      // ── /help ──────────────────────────────────────────────
       case 'help': {
         const embed = new EmbedBuilder()
           .setColor(0x3498DB)
           .setTitle('📖 RFID Access Control — Commands')
           .setDescription([
-            '**Access Management**',
-            '`/grant_day <uid|name>` — Grant today-only access (Leader/Member)',
-            '`/revoke_day <uid|name>` — Revoke an active day grant',
-            '`/revoke_access <uid|name>` — Block further scans (sets role to Pending, requires Discord approval on next scan)',
-            '`/open_door` — Remotely open the door now',
-            '',
-            '**Member Management**',
-            '`/add <name> <uid> [role]` — Add a new member',
-            '`/ban <uid|name>` — Permanently ban a member',
-            '`/unban <uid|name> [role]` — Unban and restore role (default: Leader)',
-            '`/setrole <uid|name> <role> [name]` — Change role (and optionally rename)',
-            '`/rename <uid|name> <name>` — Rename a member',
-            '',
-            '**Info**',
+            '`/add <n> <uid> [role]` — Add a new member',
+            '`/ban <uid>` — Permanently ban a member',
+            '`/unban <uid> [role]` — Unban and restore role (default: Member)',
+            '`/grant_day <uid>` — Grant today-only access (Leader/Member)',
+            '`/revoke_day <uid>` — Revoke day grant',
+            '`/revoke_access <uid>` — Revoke all temporary access',
+            '`/open_door` — Remotely open the door',
+            '`/setrole <uid> <role> [name]` — Change role (and optionally rename)',
+            '`/rename <uid> <n>` — Rename a member',
             '`/list [role]` — List members grouped by role',
             '`/pending` — Show active pending request',
-            '`/log [n]` — Show recent access logs (default: 20)',
+            '`/log [n]` — Show recent access logs',
             '`/report` — Full access report',
             '`/status` — System status',
             '`/sync` — Force re-push all members to ESP32',
-            '',
-            '> 💡 After using `/revoke_access`, the member\'s next scan will appear in Discord for approval. Use `/grant_day` to restore them.',
+            '`/help` — This message',
           ].join('\n'));
         await respond(interaction, { embeds: [embed], flags: MessageFlags.Ephemeral });
         break;
       }
 
-      // ── unknown ────────────────────────────────────────────
       default: {
         await respond(interaction, { content: '❓ Unknown command.', flags: MessageFlags.Ephemeral });
         break;
