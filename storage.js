@@ -1,6 +1,6 @@
 // ============================================================
 //  storage.js — Member database & log management
-//  File 4/4  |  RFID Access Control Bot
+//  File 4/4  |  RFID Access Control Bot  |  v3.1
 // ============================================================
 'use strict';
 
@@ -18,45 +18,44 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ─── DEFAULT MEMBERS ─────────────────────────────────────────
 const DEFAULTS = [
-  { name: "Islem",        uid: "0002787912", role: "Leader"         },
-  { name: "Djilali",      uid: "0007680714", role: "ExclusiveBoard" },
-  { name: "Ibtissem",     uid: "0006505824", role: "Leader"         },
-  { name: "Feriel",       uid: "0009860301", role: "Leader"         },
-  { name: "Ismail",       uid: "0007875382", role: "Leader"         },
-  { name: "Khadidja",     uid: "0003752638", role: "Leader"         },
-  { name: "abdelmadjid",  uid: "0010619675", role: "Leader"         },
-  { name: "Abdellah",     uid: "0006579751", role: "Leader"         },
-  { name: "Mahdi",        uid: "0008321581", role: "Leader"         },
-  { name: "Anis",         uid: "0007869479", role: "Leader"         },
-  { name: "maroua",       uid: "0009686941", role: "Leader"         },
-  { name: "djamel",       uid: "0014351112", role: "Leader"         },
-  { name: "Abd Erraouf",  uid: "0004022966", role: "Leader"         },
-  { name: "amira",        uid: "0006819271", role: "ExclusiveBoard" },
-  { name: "Lafdal",       uid: "0002672952", role: "Leader"         },
-  { name: "IKHLAS",       uid: "0014755425", role: "Leader"         },
-  { name: "YAZI",         uid: "0006527607", role: "President"      },
-  { name: "Ziouani",      uid: "0014692887", role: "ExclusiveBoard" },
-  { name: "Dhaia",        uid: "0009660230", role: "Leader"         },
-  { name: "adem",         uid: "0006557881", role: "ExclusiveBoard" },
-  { name: "Ibrahim",      uid: "0010940033", role: "Leader"         },
-  { name: "Nour",         uid: "0014883107", role: "ExclusiveBoard" },
-  { name: "dounia",       uid: "0006587684", role: "Leader"         },
+  { name: "Islem",        uid: "0002787912", role: "Member" },
+  { name: "Djilali",      uid: "0007680714", role: "Member" },
+  { name: "Ibtissem",     uid: "0006505824", role: "Member" },
+  { name: "Feriel",       uid: "0009860301", role: "Member" },
+  { name: "Ismail",       uid: "0007875382", role: "Member" },
+  { name: "Khadidja",     uid: "0003752638", role: "Member" },
+  { name: "abdelmadjid",  uid: "0010619675", role: "Member" },
+  { name: "Abdellah",     uid: "0006579751", role: "Member" },
+  { name: "Mahdi",        uid: "0008321581", role: "Member" },
+  { name: "Anis",         uid: "0007869479", role: "Member" },
+  { name: "maroua",       uid: "0009686941", role: "Member" },
+  { name: "djamel",       uid: "0014351112", role: "Member" },
+  { name: "Abd Erraouf",  uid: "0004022966", role: "Member" },
+  { name: "amira",        uid: "0006819271", role: "Member" },
+  { name: "Lafdal",       uid: "0002672952", role: "Member" },
+  { name: "IKHLAS",       uid: "0014755425", role: "Member" },
+  { name: "YAZI",         uid: "0006527607", role: "Member" },
+  { name: "Ziouani",      uid: "0014692887", role: "Member" },
+  { name: "Dhaia",        uid: "0009660230", role: "Member" },
+  { name: "adem",         uid: "0006557881", role: "Member" },
+  { name: "Ibrahim",      uid: "0010940033", role: "President" },
+  { name: "Nour",         uid: "0014883107", role: "Member" },
+  { name: "dounia",       uid: "0006587684", role: "Member" },
+  { name: "amani",        uid: "0009962268", role: "Member" },
 ];
 
 // ─── UID NORMALIZE ───────────────────────────────────────────
-// Pads any UID to 10 digits with leading zeros so lookups are consistent
-// regardless of whether the ESP, command, or CSV omit leading zeros.
 function normalizeUID(uid) {
-  const s = String(uid).trim();
-  return s.length >= 10 ? s : s.padStart(10, '0');
+  const s = String(uid).trim().replace(/\D/g, '');
+  if (!s) return '';
+  return s.slice(-10).padStart(10, '0');
 }
 
 // ─── UID MATCH: right-to-left, leading-zero tolerant ─────────
-// Still kept for backward compat with edge cases, but most paths
-// now normalize first so a simple equality check would also work.
 function uidMatch(stored, scanned) {
   const s = String(stored).trim();
   const c = String(scanned).trim();
+  if (!s || !c) return false;
   let si = s.length - 1, ci = c.length - 1;
   while (si >= 0 && ci >= 0) {
     if (s[si] !== c[ci]) return false;
@@ -66,7 +65,12 @@ function uidMatch(stored, scanned) {
     if (s[si] !== '0') return false;
     si--;
   }
-  return true;
+  return ci < 0;
+}
+
+// ─── CSV FIELD SANITIZER ─────────────────────────────────────
+function csvField(v) {
+  return String(v == null ? '' : v).replace(/,/g, ';').replace(/\r?\n/g, ' ');
 }
 
 // ─── CSV PARSING ─────────────────────────────────────────────
@@ -79,7 +83,7 @@ function parseMembersCSV(content) {
     if (!name || !uid || !role) continue;
     members.push({
       name:         name.trim(),
-      uid:          normalizeUID(uid),   // normalize on load so DB is always consistent
+      uid:          normalizeUID(uid),
       role:         role.trim(),
       banned:       banned?.trim() === '1',
       dayGrant:     dayGrant?.trim() === '1',
@@ -92,7 +96,7 @@ function parseMembersCSV(content) {
 function serializeMembersCSV(members) {
   const header = '# name,uid,role,banned,dayGrant,dayGrantDate\n';
   const rows   = members.map(m =>
-    `${m.name},${m.uid},${m.role},${m.banned?1:0},${m.dayGrant?1:0},${m.dayGrantDate||0}`
+    `${csvField(m.name)},${csvField(m.uid)},${csvField(m.role)},${m.banned?1:0},${m.dayGrant?1:0},${m.dayGrantDate||0}`
   ).join('\n');
   return header + rows + '\n';
 }
@@ -104,16 +108,12 @@ function loadMembers() {
   try {
     if (fs.existsSync(MEMBERS_FILE)) {
       db = parseMembersCSV(fs.readFileSync(MEMBERS_FILE, 'utf8'));
-      console.log(`[DB] Loaded ${db.length} members from members.csv`);
-      return;
+      if (db.length > 0) { console.log(`[DB] Loaded ${db.length} members`); return; }
     }
     if (fs.existsSync(MEMBERS_BACKUP)) {
       db = parseMembersCSV(fs.readFileSync(MEMBERS_BACKUP, 'utf8'));
-      console.log(`[DB] Loaded ${db.length} members from backup`);
-      saveMembers();
-      return;
+      if (db.length > 0) { console.log(`[DB] Loaded ${db.length} from backup`); saveMembers(); return; }
     }
-    // Only use defaults if both CSV files are missing or unreadable
     console.log('[DB] No CSV found — loading defaults');
     db = DEFAULTS.map(d => ({ ...d, uid: normalizeUID(d.uid), banned: false, dayGrant: false, dayGrantDate: 0 }));
     saveMembers();
@@ -135,11 +135,9 @@ function saveMembers() {
 }
 
 // ─── QUERY ───────────────────────────────────────────────────
-// FIX: normalize the incoming UID before lookup so "628801", "0000628801",
-// and "0000628801" all resolve to the same record regardless of how
-// the ESP or the Discord user typed it.
 function findByUID(uid) {
   const norm = normalizeUID(uid);
+  if (!norm) return null;
   return db.find(m => m.uid === norm || uidMatch(m.uid, norm)) || null;
 }
 
@@ -155,6 +153,7 @@ function getMemberCount() { return db.length; }
 
 function addMember(name, uid, role) {
   const normUID = normalizeUID(uid);
+  if (!normUID) return { ok: false, reason: 'Invalid UID' };
   const exists  = db.find(m => m.uid === normUID || uidMatch(m.uid, normUID));
   if (exists) return { ok: false, reason: `UID already exists (matched: ${exists.name})` };
   const member = {
@@ -171,14 +170,11 @@ function addMember(name, uid, role) {
   return { ok: true, member };
 }
 
-// FIX: if UID not found, create a new "Unknown" entry and ban it immediately.
-// This handles the case where an unknown card scanned and you want to
-// pre-emptively ban it before it ever gets added as a real member.
 function banMember(uid) {
   const normUID = normalizeUID(uid);
+  if (!normUID) return { ok: false, reason: 'Invalid UID' };
   let m = findByUID(normUID);
   if (!m) {
-    // Unknown UID — add it as a banned entry so it is tracked and rejected by ESP
     m = {
       name:         'Unknown',
       uid:          normUID,
@@ -217,8 +213,6 @@ function setRole(uid, role) {
   return { ok: true, member: m };
 }
 
-// FIX: if UID not found, create the member with the given name instead of erroring.
-// This handles the /setrole [name] flow where the card was never formally added.
 function renameMember(uid, name) {
   const normUID = normalizeUID(uid);
   let m = findByUID(normUID);
@@ -292,7 +286,10 @@ function peekQueue() { return [...updateQueue]; }
 // ─── LOG SYSTEM ──────────────────────────────────────────────
 function appendLog(entry) {
   try {
-    const line = `${Date.now()},${entry.uid||''},${entry.name||''},${entry.role||''},${entry.event||''},${entry.reason||''},${entry.time||''}\n`;
+    if (!fs.existsSync(LOGS_FILE)) {
+      fs.writeFileSync(LOGS_FILE, 'timestamp,uid,name,role,event,reason,esp_time\n', 'utf8');
+    }
+    const line = `${Date.now()},${csvField(entry.uid)},${csvField(entry.name)},${csvField(entry.role)},${csvField(entry.event)},${csvField(entry.reason)},${csvField(entry.time)}\n`;
     fs.appendFileSync(LOGS_FILE, line, 'utf8');
   } catch (e) { console.error('[LOG] Write error:', e.message); }
 }
@@ -301,7 +298,8 @@ function getRecentLogs(n = 50) {
   try {
     if (!fs.existsSync(LOGS_FILE)) return [];
     const lines = fs.readFileSync(LOGS_FILE, 'utf8').trim().split('\n').filter(Boolean);
-    return lines.slice(-n).reverse().map(l => {
+    const dataLines = lines[0]?.startsWith('timestamp,') ? lines.slice(1) : lines;
+    return dataLines.slice(-n).reverse().map(l => {
       const [ts, uid, name, role, event, reason, time] = l.split(',');
       return { ts: parseInt(ts), uid, name, role, event, reason, time };
     });
