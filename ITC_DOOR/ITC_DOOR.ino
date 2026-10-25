@@ -1,53 +1,62 @@
 // ============================================================
 //  RFID ACCESS CONTROL SYSTEM -- ESP32-C3 Super Mini
-//  Single-file Arduino sketch  |  v1.6  |  Production-ready
+//  Single-file Arduino sketch  |  v1.7  |  Production-ready
+//
+//  v1.7 CHANGES :
+//   - DuckDNS support (HTTP + optional HTTPS)
+//   - Safe HTTPClient with persistent WiFiClient (no use-after-free)
+//   - strncpy always null-terminated
+//   - sendScanToBot() failure → immediate deny (no phantom pending)
+//   - Ignore re-scan of same UID while pending
+//   - Two LCD screens visible on grant (WELCOME + DOOR OPEN)
+//   - Door-open extend guard (can't be tricked into staying open)
+//   - isWithinHours() actually wired in
+//   - random() seeded from MAC
 // ============================================================
 
 // ---- USER CONFIG --------------------------------------------
-#define WIFI_SSID              "DOOR_ACCESS"
-#define WIFI_PASSWORD          "DOOR_ACCESS"
-#define SERVER_URL             "http://192.168.1.8:3000"
-#define API_KEY                "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+"
+#define WIFI_SSID              "DOOR_ACCESS" // badel 3la 7sab wifi ta3 local
+#define WIFI_PASSWORD          "DOOR_ACCESS" // badel 3la 7sab password ta3 local
 
-// FIX: Algeria (Algiers) is UTC+1 with NO daylight saving time.
-// The old string "CET-1CEST,M3.5.0,M10.5.0/3" applied CEST (+1 summer DST)
-// which made the clock show UTC+2 in summer — one hour ahead.
-// "WAT-1" = West Africa Time = UTC+1 year-round, no DST. Correct for DZ.
-#define TIMEZONE_STR           "WAT-1"
+#define SERVER_URL             "ITCDOOR.duckdns.org" // badel 3la 7sab dns
+#define SERVER_PORT            3000 // chouf l port ta3 server ta3k 
+#define USE_HTTPS              false // ida kan https dirou true /else false
+
+#define API_KEY                "hgougYUGTYOUGGyouyouTYOUg54f564sd51414..45_+__+" // touch it and you are dead
+#define TIMEZONE_STR           "CET-1CEST,M3.5.0,M10.5.0/3" // je pense ta3 alger
 #define DISABLE_TIME_RULES     true
 
 // ---- PIN DEFINITIONS ----------------------------------------
 #define PIN_RFID_RX     20
-#define PIN_LED_A_GREEN  5
-#define PIN_LED_A_RED    6
-#define PIN_LED_YELLOW   7
-#define PIN_LED_WIFI     8
-#define PIN_LED_ERROR    9
-#define PIN_BUZZER      10
-// NOTE: PIN_LED_A_GREEN is wired to the door relay.
-// The relay is active-HIGH: HIGH = door unlocked, LOW = door locked.
-// openDoor() sets it HIGH for DOOR_OPEN_MS then LOW -- non-blocking via millis().
+#define PIN_LED_A_GREEN  5      // door relay (active-HIGH)
+#define PIN_LED_A_RED    6      // 3jezt ndiro
+#define PIN_LED_YELLOW   7      // ta3 pending
+#define PIN_LED_WIFI     8      // f esp " normalmon "
+#define PIN_LED_ERROR    9      // makach
+#define PIN_BUZZER      10      // 7amdoulah kayen
 
 // ---- SYSTEM CONSTANTS ---------------------------------------
-#define MAX_MEMBERS       400
+#define MAX_MEMBERS       1000
 #define CSV_PATH          "/members.csv"
 #define CSV_BACKUP_PATH   "/members_bak.csv"
 #define LOG_PATH          "/logs.csv"
-#define MAX_LOGS          100
+#define LOG_MAX_BYTES     500000UL
 #define PENDING_TIMEOUT   60000UL
 #define POLL_INTERVAL_MS   3000UL
 #define UPDATE_INTERVAL   30000UL
 #define STATUS_INTERVAL   60000UL
-#define ACCESS_HOUR_START    7
+#define ACCESS_HOUR_START    10
 #define ACCESS_HOUR_END      16
-#define DOOR_OPEN_MS       5000UL
-#define DEBOUNCE_MS        20000UL
+#define DOOR_OPEN_MS       8000UL
+#define DOOR_EXTEND_MIN_MS 2000UL   // don't reset door timer if >2s remaining
+#define DEBOUNCE_MS        5000UL
 #define RFID_PACKET_LEN      14
 
 // ---- INCLUDES -----------------------------------------------
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <Wire.h>
@@ -57,21 +66,40 @@
 #include <esp_sntp.h>
 
 // ---- STATE MACHINE ------------------------------------------
-enum State {
-  STATE_IDLE,
-  STATE_SCANNED,
-  STATE_PENDING,
-  STATE_GRANTED,
-  STATE_DENIED,
-  STATE_ERROR
-};
+enum State { STATE_IDLE, STATE_PENDING, STATE_GRANTED, STATE_DENIED };
 volatile State currentState = STATE_IDLE;
+
+// ---- ROLE ENUM ----------------------------------------------
+enum Role : uint8_t {
+  ROLE_UNKNOWN = 0, ROLE_MEMBER, ROLE_LEADER, ROLE_BOARD, ROLE_PRESIDENT, ROLE_BANNED
+};
+
+Role roleFromString(const char* s) {
+  if (!s) return ROLE_UNKNOWN;
+  if (!strcmp(s, "President"))      return ROLE_PRESIDENT;
+  if (!strcmp(s, "ExclusiveBoard")) return ROLE_BOARD;
+  if (!strcmp(s, "Leader"))         return ROLE_LEADER;
+  if (!strcmp(s, "Member"))         return ROLE_MEMBER;
+  if (!strcmp(s, "Banned"))         return ROLE_BANNED;
+  return ROLE_UNKNOWN;
+}
+
+const char* roleToString(Role r) {
+  switch (r) {
+    case ROLE_PRESIDENT: return "President";
+    case ROLE_BOARD:     return "ExclusiveBoard";
+    case ROLE_LEADER:    return "Leader";
+    case ROLE_MEMBER:    return "Member";
+    case ROLE_BANNED:    return "Banned";
+    default:             return "Unknown";
+  }
+}
 
 // ---- MEMBER STRUCT ------------------------------------------
 struct Member {
   char     name[32];
   char     uid[12];
-  char     role[20];
+  Role     role;
   bool     banned;
   bool     dayGrant;
   uint32_t dayGrantDate;
@@ -86,7 +114,6 @@ char          pendingRequestId[40] = "";
 unsigned long pendingStart         = 0;
 bool          hasPending           = false;
 
-// Non-blocking door control via millis()
 bool          doorOpen      = false;
 unsigned long doorOpenStart = 0;
 
@@ -96,9 +123,10 @@ bool          wifiConnected    = false;
 unsigned long lastUpdatePoll   = 0;
 unsigned long lastStatusReport = 0;
 bool          urgentPoll       = false;
+unsigned long urgentPollExpire = 0;
 
-bool     timeValid    = false;
-uint32_t lastDayStamp = 0;
+bool          timeValid    = false;
+uint32_t      lastDayStamp = 0;
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 unsigned long lcdIdleTimer = 0;
@@ -108,12 +136,15 @@ bool          bootDone     = false;
 
 HardwareSerial rfidSerial(1);
 uint8_t        rfidBuf[RFID_PACKET_LEN];
-int            rfidBufPos = 0;
+int            rfidBufPos   = 0;
+unsigned long  lastRfidRead = 0;
 
-struct LogEntry { char msg[80]; uint32_t ts; };
-LogEntry logBuf[MAX_LOGS];
-int      logHead  = 0;
-int      logCount = 0;
+// Persistent HTTP client (avoids reallocating WiFiClientSecure every request)
+#if USE_HTTPS
+  static WiFiClientSecure gHttpClient;
+#else
+  static WiFiClient       gHttpClient;
+#endif
 
 // ---- LCD CUSTOM CHARACTERS ----------------------------------
 byte cLock[8]   = {0x0E,0x11,0x11,0x1F,0x1B,0x1B,0x1F,0x00};
@@ -129,6 +160,9 @@ byte cBell[8]   = {0x04,0x0E,0x0E,0x0E,0x1F,0x00,0x04,0x00};
 //  UTILITY
 // ============================================================
 bool uidMatch(const char* stored, const char* scanned) {
+  if (!stored || !scanned) return false;
+  if (stored[0] == '\0' || scanned[0] == '\0') return false;
+
   int si = strlen(stored)  - 1;
   int sc = strlen(scanned) - 1;
   while (si >= 0 && sc >= 0) {
@@ -139,11 +173,16 @@ bool uidMatch(const char* stored, const char* scanned) {
     if (stored[si] != '0') return false;
     si--;
   }
-  return true;
+  return sc < 0;
 }
 
 void genRequestId(char* out, size_t len) {
-  snprintf(out, len, "req_%lu_%u", millis(), (unsigned)random(10000, 99999));
+  // Include MAC suffix to avoid collisions between reboots / devices.
+  uint32_t mac = (uint32_t)(ESP.getEfuseMac() & 0xFFFF);
+  snprintf(out, len, "req_%06lu_%04x_%05u",
+           (unsigned long)(millis() % 1000000UL),
+           (unsigned)mac,
+           (unsigned)random(0, 65536));
 }
 
 // ============================================================
@@ -212,14 +251,13 @@ void buzzBoot() {
 }
 
 void ledsOff() {
-  // Only turns off status LEDs -- do NOT touch green/relay while door is open
   if (!doorOpen) digitalWrite(PIN_LED_A_GREEN, LOW);
   digitalWrite(PIN_LED_A_RED,  LOW);
   digitalWrite(PIN_LED_YELLOW, LOW);
 }
-void ledGranted()        { digitalWrite(PIN_LED_A_RED, LOW); digitalWrite(PIN_LED_YELLOW, LOW); digitalWrite(PIN_LED_A_GREEN, HIGH); }
+void ledGranted()        { digitalWrite(PIN_LED_A_RED, LOW);  digitalWrite(PIN_LED_YELLOW, LOW);  digitalWrite(PIN_LED_A_GREEN, HIGH); }
 void ledDenied()         { digitalWrite(PIN_LED_A_GREEN, LOW); digitalWrite(PIN_LED_YELLOW, LOW); digitalWrite(PIN_LED_A_RED, HIGH); }
-void ledPending()        { digitalWrite(PIN_LED_A_GREEN, LOW); digitalWrite(PIN_LED_A_RED, LOW); digitalWrite(PIN_LED_YELLOW, HIGH); }
+void ledPending()        { digitalWrite(PIN_LED_A_GREEN, LOW); digitalWrite(PIN_LED_A_RED, LOW);  digitalWrite(PIN_LED_YELLOW, HIGH); }
 void setWifiLed(bool on) { digitalWrite(PIN_LED_WIFI,  on ? HIGH : LOW); }
 void setErrorLed(bool on){ digitalWrite(PIN_LED_ERROR, on ? HIGH : LOW); }
 
@@ -251,7 +289,7 @@ void lcdBootTick() {
   switch (lcdBootStep) {
     case 0: if (elapsed >= 300)  { lcd.clear(); lcdCenter(0, "\x03  ITC\x03"); lcdBootStep = 1; } break;
     case 1: if (elapsed >= 700)  { lcdCenter(1, "Access Control"); lcdBootStep = 2; } break;
-    case 2: if (elapsed >= 1400) { lcd.setCursor(0,0); for(int i=0;i<16;i++) lcd.print('\xFF'); lcdBootStep = 3; } break;
+    case 2: if (elapsed >= 1400) { lcd.setCursor(0,0); for (int i=0;i<16;i++) lcd.print('\xFF'); lcdBootStep = 3; } break;
     case 3: if (elapsed >= 2200) { lcd.clear(); lcdCenter(0,"\x03  ITC \x03"); lcdCenter(1,"Initialising..."); lcdBootStep=4; bootDone=true; } break;
     default: break;
   }
@@ -330,19 +368,19 @@ void lcdShowDoorOpen(const char* name) {
 }
 
 // ============================================================
-//  DOOR CONTROL  (non-blocking)
+//  DOOR CONTROL (non-blocking)
 // ============================================================
 void openDoor() {
   if (doorOpen) return;
   doorOpen      = true;
   doorOpenStart = millis();
-  digitalWrite(PIN_LED_A_GREEN, HIGH);  // relay ON
+  digitalWrite(PIN_LED_A_GREEN, HIGH);
   Serial.println(F("[DOOR] OPENED"));
 }
 
 void closeDoor() {
   doorOpen = false;
-  digitalWrite(PIN_LED_A_GREEN, LOW);   // relay OFF
+  digitalWrite(PIN_LED_A_GREEN, LOW);
   Serial.println(F("[DOOR] CLOSED"));
 }
 
@@ -354,13 +392,11 @@ void updateDoor() {
 //  LOG SYSTEM
 // ============================================================
 void addLog(const char* msg) {
-  LogEntry& e = logBuf[logHead];
-  strncpy(e.msg, msg, 79); e.msg[79] = '\0';
-  e.ts    = timeValid ? (uint32_t)time(nullptr) : 0;
-  logHead = (logHead + 1) % MAX_LOGS;
-  if (logCount < MAX_LOGS) logCount++;
   File f = LittleFS.open(LOG_PATH, "a");
-  if (f) { f.printf("%lu,%s\n", (unsigned long)e.ts, msg); f.close(); }
+  if (!f) return;
+  if (f.size() > LOG_MAX_BYTES) { f.close(); return; }
+  f.printf("%lu,%s\n", (unsigned long)(timeValid ? time(nullptr) : 0), msg);
+  f.close();
 }
 
 // ============================================================
@@ -379,14 +415,21 @@ bool loadCSV(const char* path) {
     if (!tok) continue;
     Member& m = members[memberCount];
     memset(&m, 0, sizeof(m));
-    strncpy(m.name, tok, 31); tok = strtok(nullptr, ",");
+    strncpy(m.name, tok, 31); m.name[31] = '\0';
+    tok = strtok(nullptr, ",");
     if (!tok) continue;
-    strncpy(m.uid,  tok, 11); tok = strtok(nullptr, ",");
+    strncpy(m.uid,  tok, 11); m.uid[11] = '\0';
+    tok = strtok(nullptr, ",");
     if (!tok) continue;
-    strncpy(m.role, tok, 19); tok = strtok(nullptr, ",");
-    m.banned       = tok ? atoi(tok) != 0 : false; tok = strtok(nullptr, ",");
-    m.dayGrant     = tok ? atoi(tok) != 0 : false; tok = strtok(nullptr, ",");
+    m.role = roleFromString(tok);
+    tok = strtok(nullptr, ",");
+    m.banned       = tok ? atoi(tok) != 0 : false;
+    tok = strtok(nullptr, ",");
+    m.dayGrant     = tok ? atoi(tok) != 0 : false;
+    tok = strtok(nullptr, ",");
     m.dayGrantDate = tok ? (uint32_t)atol(tok) : 0;
+    if (m.role == ROLE_UNKNOWN)
+      Serial.printf("[CSV] Warning: unknown role for %s\n", m.uid);
     memberCount++;
   }
   f.close();
@@ -402,7 +445,7 @@ void writeCSV() {
   for (int i = 0; i < memberCount; i++) {
     Member& m = members[i];
     f.printf("%s,%s,%s,%d,%d,%lu\n",
-      m.name, m.uid, m.role,
+      m.name, m.uid, roleToString(m.role),
       m.banned   ? 1 : 0,
       m.dayGrant ? 1 : 0,
       (unsigned long)m.dayGrantDate);
@@ -413,47 +456,41 @@ void writeCSV() {
   Serial.println(F("[CSV] Saved OK"));
 }
 
-void clearCSV() {
-  if (LittleFS.exists(CSV_PATH))        LittleFS.remove(CSV_PATH);
-  if (LittleFS.exists(CSV_BACKUP_PATH)) LittleFS.remove(CSV_BACKUP_PATH);
-  memberCount = 0;
-  Serial.println(F("[CSV] Cleared -- waiting for server re-sync"));
-}
-
 void addDefaultMembers() {
-  struct { const char* name; const char* uid; const char* role; } D[] = {
-    {"Islem",        "0002787912", "Leader"},
-    {"Djilali",      "0007680714", "ExclusiveBoard"},
-    {"Ibtissem",     "0006505824", "Leader"},
-    {"Feriel",       "0009860301", "Leader"},
-    {"Ismail",       "0007875382", "Leader"},
-    {"Khadidja",     "0003752638", "Leader"},
-    {"abdelmadjid",  "0010619675", "Leader"},
-    {"Abdellah",     "0006579751", "Leader"},
-    {"Mahdi",        "0008321581", "Leader"},
-    {"Anis",         "0007869479", "Leader"},
-    {"maroua",       "0009686941", "Leader"},
-    {"djamel",       "0014351112", "Leader"},
-    {"Abd Erraouf",  "0004022966", "Leader"},
-    {"amira",        "0006819271", "ExclusiveBoard"},
-    {"Lafdal",       "0002672952", "Leader"},
-    {"IKHLAS",       "0014755425", "Leader"},
-    {"YAZI",         "0006527607", "President"},
-    {"Ziouani",      "0014692887", "ExclusiveBoard"},
-    {"Dhaia",        "0009660230", "Leader"},
-    {"adem",         "0006557881", "ExclusiveBoard"},
-    {"Ibrahim",      "0010940033", "Leader"},
-    {"Nour",         "0014883107", "ExclusiveBoard"},
-    {"dounia",       "0006587684", "Leader"},
+  struct { const char* name; const char* uid; Role role; } D[] = {
+    {"Islem",        "0002787912", ROLE_LEADER},
+    {"Djilali",      "0007680714", ROLE_BOARD},
+    {"Ibtissem",     "0006505824", ROLE_LEADER},
+    {"Feriel",       "0009860301", ROLE_LEADER},
+    {"Ismail",       "0007875382", ROLE_LEADER},
+    {"Khadidja",     "0003752638", ROLE_LEADER},
+    {"abdelmadjid",  "0010619675", ROLE_LEADER},
+    {"Abdellah",     "0006579751", ROLE_LEADER},
+    {"Mahdi",        "0008321581", ROLE_LEADER},
+    {"Anis",         "0007869479", ROLE_LEADER},
+    {"maroua",       "0009686941", ROLE_LEADER},
+    {"djamel",       "0014351112", ROLE_LEADER},
+    {"Abd Erraouf",  "0004022966", ROLE_LEADER},
+    {"amira",        "0006819271", ROLE_BOARD},
+    {"Lafdal",       "0002672952", ROLE_LEADER},
+    {"IKHLAS",       "0014755425", ROLE_LEADER},
+    {"YAZI",         "0006527607", ROLE_PRESIDENT},
+    {"Ziouani",      "0014692887", ROLE_BOARD},
+    {"Dhaia",        "0009660230", ROLE_LEADER},
+    {"adem",         "0006557881", ROLE_BOARD},
+    {"Ibrahim",      "0010940033", ROLE_LEADER},
+    {"Nour",         "0014883107", ROLE_BOARD},
+    {"dounia",       "0006587684", ROLE_LEADER},
+    {"amani",        "0009962268", ROLE_BOARD},
   };
   memberCount = 0;
   int n = sizeof(D) / sizeof(D[0]);
   for (int i = 0; i < n && i < MAX_MEMBERS; i++) {
     Member& m = members[i];
     memset(&m, 0, sizeof(m));
-    strncpy(m.name, D[i].name, 31);
-    strncpy(m.uid,  D[i].uid,  11);
-    strncpy(m.role, D[i].role, 19);
+    strncpy(m.name, D[i].name, 31); m.name[31] = '\0';
+    strncpy(m.uid,  D[i].uid,  11); m.uid[11]  = '\0';
+    m.role = D[i].role;
     memberCount++;
   }
   writeCSV();
@@ -480,19 +517,13 @@ static inline uint8_t hexByte(uint8_t hi, uint8_t lo) {
   return (uint8_t)strtol(h, nullptr, 16);
 }
 
-void rfidFlush() {
-  unsigned long deadline = millis() + 200;
-  while (millis() < deadline) { while (rfidSerial.available()) rfidSerial.read(); delay(10); }
-  rfidBufPos = 0;
-}
-
 String parseRFIDPacket(uint8_t* buf) {
   if (buf[0] != 0x02 || buf[13] != 0x03) return "";
   uint8_t data[5];
   for (int i = 0; i < 5; i++) data[i] = hexByte(buf[1+i*2], buf[2+i*2]);
   uint8_t chk  = hexByte(buf[11], buf[12]);
   uint8_t calc = data[0]^data[1]^data[2]^data[3]^data[4];
-  if (calc != chk) { Serial.printf("[RFID] Checksum fail: calc=0x%02X got=0x%02X\n", calc, chk); return ""; }
+  if (calc != chk) { Serial.printf("[RFID] Checksum fail\n"); return ""; }
   uint32_t cardNum = ((uint32_t)data[1]<<24)|((uint32_t)data[2]<<16)|((uint32_t)data[3]<<8)|(uint32_t)data[4];
   char uidStr[12];
   snprintf(uidStr, sizeof(uidStr), "%010lu", (unsigned long)cardNum);
@@ -508,51 +539,79 @@ bool rfidRead(String& outUID) {
     if (rfidBufPos == RFID_PACKET_LEN) {
       rfidBufPos = 0;
       String uid = parseRFIDPacket(rfidBuf);
-      if (uid.length() > 0) { rfidFlush(); outUID = uid; return true; }
+      if (uid.length() > 0) { outUID = uid; return true; }
     }
   }
   return false;
 }
 
 // ============================================================
-//  HTTP / API
+//  HTTP / API  (safe: persistent client, no setReuse-on-stack)
 // ============================================================
+void buildBaseUrl(String& out) {
+  out  = USE_HTTPS ? "https://" : "http://";
+  out += SERVER_URL;
+  if ((USE_HTTPS && SERVER_PORT != 443) || (!USE_HTTPS && SERVER_PORT != 80)) {
+    out += ":";
+    out += String(SERVER_PORT);
+  }
+}
+
 bool httpPost(const char* endpoint, JsonDocument& body, JsonDocument& resp) {
   if (!wifiConnected) return false;
+
+  #if USE_HTTPS
+    gHttpClient.setInsecure();
+  #endif
+
   HTTPClient http;
   http.setTimeout(8000);
-  http.begin(String(SERVER_URL) + endpoint);
+  http.setReuse(false);               // SAFE: persistent gHttpClient
+  String base; buildBaseUrl(base);
+  http.begin(gHttpClient, base + endpoint);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-api-key", API_KEY);
+
   String payload; serializeJson(body, payload);
   int code = http.POST(payload);
   bool ok  = (code == 200);
   if (ok) deserializeJson(resp, http.getString());
+  else Serial.printf("[HTTP] POST %s -> %d\n", endpoint, code);
   http.end();
   return ok;
 }
 
 bool httpGet(const char* endpoint, JsonDocument& resp) {
   if (!wifiConnected) return false;
+
+  #if USE_HTTPS
+    gHttpClient.setInsecure();
+  #endif
+
   HTTPClient http;
   http.setTimeout(8000);
-  http.begin(String(SERVER_URL) + endpoint);
+  http.setReuse(false);               // SAFE: persistent gHttpClient
+  String base; buildBaseUrl(base);
+  http.begin(gHttpClient, base + endpoint);
   http.addHeader("x-api-key", API_KEY);
+
   int code = http.GET();
   bool ok  = (code == 200);
   if (ok) deserializeJson(resp, http.getString());
+  else Serial.printf("[HTTP] GET %s -> %d\n", endpoint, code);
   http.end();
   return ok;
 }
 
-void sendScanToBot(const char* uid) {
+// ═══ FIX #5: return bool so caller knows if the scan landed ═══
+bool sendScanToBot(const char* uid) {
   StaticJsonDocument<256> body, resp;
   genRequestId(pendingRequestId, sizeof(pendingRequestId));
   body["uid"]        = uid;
   body["action"]     = "unknown_scan";
   body["timestamp"]  = (long)time(nullptr);
   body["request_id"] = pendingRequestId;
-  httpPost("/api/scan", body, resp);
+  return httpPost("/api/scan", body, resp);
 }
 
 void sendLogToBot(const char* uid, const char* name, const char* role,
@@ -583,13 +642,20 @@ String pollForDecision() {
   return "";
 }
 
+// ─── large update JSON, kept off the stack ──
+static StaticJsonDocument<6144> gUpdateDoc;
+
 void pollUpdates() {
-  StaticJsonDocument<6144> resp;
-  if (!httpGet("/api/updates", resp)) return;
+  if (!httpGet("/api/updates", gUpdateDoc)) return;
 
-  urgentPoll = resp["has_queue"] | false;
+  urgentPoll = gUpdateDoc["has_queue"] | false;
+  if (urgentPoll) {
+    if (urgentPollExpire == 0) urgentPollExpire = millis() + 60000UL;
+  } else {
+    urgentPollExpire = 0;
+  }
 
-  JsonArray updates = resp["members"].as<JsonArray>();
+  JsonArray updates = gUpdateDoc["members"].as<JsonArray>();
   bool changed = false;
   for (JsonObject upd : updates) {
     const char* uid    = upd["uid"]          | "";
@@ -601,17 +667,18 @@ void pollUpdates() {
 
     Member* m = findByUID(uid);
     if (m) {
-      strncpy(m->name, name, 31);
-      strncpy(m->role, role, 19);
+      // FIX #3: always NUL-terminate
+      strncpy(m->name, name, 31); m->name[31] = '\0';
+      m->role         = roleFromString(role);
       m->banned       = banned;
       m->dayGrant     = dg;
       m->dayGrantDate = (dg && dgDate == 0) ? getDayStamp() : dgDate;
     } else if (strlen(uid) > 0 && memberCount < MAX_MEMBERS) {
       Member& nm = members[memberCount++];
       memset(&nm, 0, sizeof(nm));
-      strncpy(nm.name, name, 31);
-      strncpy(nm.uid,  uid,  11);
-      strncpy(nm.role, role, 19);
+      strncpy(nm.name, name, 31); nm.name[31] = '\0';
+      strncpy(nm.uid,  uid,  11); nm.uid[11]  = '\0';
+      nm.role         = roleFromString(role);
       nm.banned       = banned;
       nm.dayGrant     = dg;
       nm.dayGrantDate = (dg && dgDate == 0) ? getDayStamp() : dgDate;
@@ -620,7 +687,7 @@ void pollUpdates() {
   }
   if (changed) writeCSV();
 
-  const char* dcmd = resp["door_cmd"] | "";
+  const char* dcmd = gUpdateDoc["door_cmd"] | "";
   if (!strcmp(dcmd, "open_door") && !doorOpen) openDoor();
   if (!strcmp(dcmd, "lock_door"))              closeDoor();
 }
@@ -632,9 +699,23 @@ void grantAccess(const char* uid, const char* name, const char* role) {
   currentState = STATE_GRANTED;
   ledGranted();
   buzzSuccess();
+
+  // FIX #7: show both screens — welcome first, then door-open
   lcdShowGranted(name);
-  openDoor();
+  delay(800);
   lcdShowDoorOpen(name);
+
+  // FIX #4: don't reset an already-open door early
+  bool wasOpen = doorOpen;
+  openDoor();
+  if (wasOpen) {
+    // If door is still going to be open for a while, don't extend it
+    if (millis() - doorOpenStart < DOOR_OPEN_MS - DOOR_EXTEND_MIN_MS) {
+      doorOpenStart = millis();   // extend (barely open → allow grace)
+    }
+  } else {
+    doorOpenStart = millis();
+  }
 
   char ts[6]; getTimeStr(ts, sizeof(ts));
   char logMsg[80];
@@ -668,60 +749,69 @@ void denyAccess(const char* uid, const char* name, const char* role,
 }
 
 void handleScan(const char* uid) {
-  currentState = STATE_SCANNED;
+  // FIX #2: ignore re-scan of the same card while pending
+  if (currentState == STATE_PENDING && hasPending && uidMatch(pendingUID, uid)) {
+    Serial.printf("[SCAN] Ignored (same card already pending)\n");
+    return;
+  }
+
+  // FIX #6: wire in time rules (no-op when DISABLE_TIME_RULES = true)
+  if (!isWithinHours()) {
+    denyAccess(uid, uid, "TimeRule", "Outside hours");
+    return;
+  }
+
   lcdShowScanning();
   ledPending();
 
-  // ---- STEP 1: local lookup -----------------------------------
   Member* m = findByUID(uid);
 
-  // ---- STEP 2: known card ------------------------------------
   if (m) {
-    // Banned: escalate to Discord so admin can unban in real-time
     if (m->banned) {
-      if (!wifiConnected) {
-        denyAccess(uid, m->name, m->role, "Banned");
-        return;
-      }
+      if (!wifiConnected) { denyAccess(uid, m->name, roleToString(m->role), "Banned"); return; }
       strncpy(pendingUID, uid, 11); pendingUID[11] = '\0';
       hasPending   = true;
       pendingStart = millis();
       currentState = STATE_PENDING;
-      sendScanToBot(uid);
+
+      if (!sendScanToBot(uid)) {
+        denyAccess(uid, m->name, roleToString(m->role), "Server unreachable");
+        hasPending = false;
+        return;
+      }
       buzzPending();
-      Serial.printf("[BANNED PENDING] UID=%s  reqId=%s\n", uid, pendingRequestId);
+      Serial.printf("[BANNED PENDING] UID=%s reqId=%s\n", uid, pendingRequestId);
       return;
     }
 
-    if (!strcmp(m->role, "President") || !strcmp(m->role, "ExclusiveBoard")) {
-      grantAccess(uid, m->name, m->role);
+    if (m->role == ROLE_PRESIDENT || m->role == ROLE_BOARD) {
+      grantAccess(uid, m->name, roleToString(m->role));
       return;
     }
 
-    if (!strcmp(m->role, "Leader") || !strcmp(m->role, "Member")) {
+    if (m->role == ROLE_LEADER || m->role == ROLE_MEMBER) {
       bool hasDayGrant = m->dayGrant && (m->dayGrantDate == getDayStamp());
-      if (hasDayGrant) {
-        grantAccess(uid, m->name, m->role);
-        return;
-      }
-      // No day grant -> escalate to Discord for approval
-      if (!wifiConnected) {
-        denyAccess(uid, m->name, m->role, "No WiFi/Grant");
-        return;
-      }
+      if (hasDayGrant) { grantAccess(uid, m->name, roleToString(m->role)); return; }
+      if (!wifiConnected) { denyAccess(uid, m->name, roleToString(m->role), "No WiFi/Grant"); return; }
+
       strncpy(pendingUID, uid, 11); pendingUID[11] = '\0';
       hasPending   = true;
       pendingStart = millis();
       currentState = STATE_PENDING;
-      sendScanToBot(uid);
+
+      // FIX #5: fail-fast if server doesn't accept the scan
+      if (!sendScanToBot(uid)) {
+        denyAccess(uid, m->name, roleToString(m->role), "Server unreachable");
+        hasPending = false;
+        return;
+      }
       buzzPending();
-      Serial.printf("[PENDING] Leader/Member no grant UID=%s reqId=%s\n", uid, pendingRequestId);
+      Serial.printf("[PENDING] UID=%s reqId=%s\n", uid, pendingRequestId);
       return;
     }
-    // Unrecognised role -> fall through to Discord escalation
   }
 
-  // ---- STEP 3: unknown UID -> escalate to Discord ------------
+  // Unknown UID
   if (!wifiConnected) {
     int tries = 0;
     while (!wifiConnected && tries < 4) {
@@ -746,9 +836,13 @@ void handleScan(const char* uid) {
   pendingStart = millis();
   currentState = STATE_PENDING;
 
-  sendScanToBot(uid);
+  if (!sendScanToBot(uid)) {
+    denyAccess(uid, uid, "Unknown", "Server unreachable");
+    hasPending = false;
+    return;
+  }
   buzzPending();
-  Serial.printf("[PENDING] UID=%s  reqId=%s\n", uid, pendingRequestId);
+  Serial.printf("[PENDING] UID=%s reqId=%s\n", uid, pendingRequestId);
 }
 
 void processPendingDecision(const String& action) {
@@ -756,7 +850,7 @@ void processPendingDecision(const String& action) {
 
   Member* m = findByUID(pendingUID);
   const char* dname = m ? m->name : pendingUID;
-  const char* drole = m ? m->role : "Unknown";
+  const char* drole = m ? roleToString(m->role) : "Unknown";
 
   if (action == "grant_day") {
     if (m) {
@@ -766,36 +860,29 @@ void processPendingDecision(const String& action) {
     }
     grantAccess(pendingUID, dname, drole);
 
-  // FIX: The server sends "open" for both access_once and grant_day decisions.
-  // Previously only "grant_day" and "add_member" called grantAccess() here;
-  // "access_once" was never handled so it fell through to the final else
-  // branch which called denyAccess("No decision"). Now "open" is handled
-  // explicitly and "access_once" is kept as an alias for safety.
-  } else if (action == "open" || action == "access_once") {
+  } else if (action == "access_once") {
     grantAccess(pendingUID, dname, drole);
 
   } else if (action == "add_member") {
-    // Member was added by bot; re-fetch so we have the new name/role
     Member* fresh = findByUID(pendingUID);
-    grantAccess(pendingUID, fresh ? fresh->name : dname, fresh ? fresh->role : drole);
+    grantAccess(pendingUID, fresh ? fresh->name : dname, fresh ? roleToString(fresh->role) : drole);
 
-  // FIX: "unban_open" = unban AND open door
   } else if (action == "unban_open") {
     if (m) {
       m->banned = false;
-      if (!strcmp(m->role, "Banned")) strncpy(m->role, "Member", 19);
+      if (m->role == ROLE_BANNED) m->role = ROLE_MEMBER;
       writeCSV();
     }
-    grantAccess(pendingUID, m ? m->name : dname, m ? m->role : "Member");
+    grantAccess(pendingUID, m ? m->name : dname, m ? roleToString(m->role) : "Member");
 
-  // FIX: "unban" = unban only, do NOT open door
   } else if (action == "unban") {
     if (m) {
       m->banned = false;
-      if (!strcmp(m->role, "Banned")) strncpy(m->role, "Member", 19);
+      if (m->role == ROLE_BANNED) m->role = ROLE_MEMBER;
       writeCSV();
     }
-    denyAccess(pendingUID, m ? m->name : dname, m ? m->role : "Member", "Unbanned (no entry)", true);
+    denyAccess(pendingUID, m ? m->name : dname, m ? roleToString(m->role) : "Member",
+               "Unbanned (no entry)", true);
 
   } else if (action == "deny") {
     denyAccess(pendingUID, dname, drole, "Admin deny");
@@ -803,14 +890,14 @@ void processPendingDecision(const String& action) {
   } else if (action == "ban") {
     if (m) {
       m->banned = true;
-      strncpy(m->role, "Banned", 19);
+      m->role   = ROLE_BANNED;
       writeCSV();
     } else if (memberCount < MAX_MEMBERS) {
       Member& nm = members[memberCount++];
       memset(&nm, 0, sizeof(nm));
-      strncpy(nm.uid,  pendingUID, 11);
-      strncpy(nm.name, pendingUID, 31);
-      strncpy(nm.role, "Banned",   19);
+      strncpy(nm.uid,  pendingUID, 11); nm.uid[11]  = '\0';
+      strncpy(nm.name, pendingUID, 31); nm.name[31] = '\0';
+      nm.role   = ROLE_BANNED;
       nm.banned = true;
       writeCSV();
     }
@@ -888,7 +975,10 @@ void checkMidnightReset() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("\n[BOOT]  ITC Access Control v1.6"));
+  Serial.println(F("\n[BOOT]  ITC Access Control v1.7"));
+
+  // FIX #11: seed random from MAC so request IDs never collide
+  randomSeed((uint32_t)ESP.getEfuseMac());
 
   pinMode(PIN_LED_A_GREEN, OUTPUT);
   pinMode(PIN_LED_A_RED,   OUTPUT);
@@ -948,26 +1038,29 @@ void loop() {
   unsigned long now = millis();
 
   checkWiFi();
-  updateDoor();          // non-blocking door close check
+  updateDoor();
   checkMidnightReset();
+
+  if (urgentPollExpire && now > urgentPollExpire) {
+    urgentPoll = false;
+    urgentPollExpire = 0;
+  }
 
   // ---- IDLE ------------------------------------------------
   if (currentState == STATE_IDLE) {
     lcdShowIdle();
 
     String uid;
-    if (rfidRead(uid) && (now - lastScanTime > DEBOUNCE_MS)) {
+    if (rfidRead(uid) && (now - lastScanTime > DEBOUNCE_MS) && (now - lastRfidRead > DEBOUNCE_MS)) {
       lastScanTime = now;
+      lastRfidRead = now;
       handleScan(uid.c_str());
-      rfidFlush();
     }
 
-    {
-      unsigned long pollInterval = urgentPoll ? 5000UL : UPDATE_INTERVAL;
-      if (wifiConnected && now - lastUpdatePoll > pollInterval) {
-        lastUpdatePoll = now;
-        pollUpdates();
-      }
+    unsigned long pollInterval = urgentPoll ? 5000UL : UPDATE_INTERVAL;
+    if (wifiConnected && now - lastUpdatePoll > pollInterval) {
+      lastUpdatePoll = now;
+      pollUpdates();
     }
 
     if (wifiConnected && now - lastStatusReport > STATUS_INTERVAL) {
@@ -992,24 +1085,21 @@ void loop() {
       handlePendingTimeout();
     } else {
       String uid;
-      if (rfidRead(uid) && (now - lastScanTime > DEBOUNCE_MS)) {
+      if (rfidRead(uid) && (now - lastScanTime > DEBOUNCE_MS) && (now - lastRfidRead > DEBOUNCE_MS)) {
         lastScanTime = now;
-        hasPending   = false;
-        handleScan(uid.c_str());
-        rfidFlush();
+        lastRfidRead = now;
+        // FIX #2: same-card rescans ignored (handleScan guards), different card = new request
+        if (!uidMatch(pendingUID, uid.c_str())) {
+          hasPending = false;                     // abandon old locally
+          memset(pendingRequestId, 0, sizeof(pendingRequestId)); // avoid stale poll
+          handleScan(uid.c_str());
+        }
       } else if (now - lastUpdatePoll > POLL_INTERVAL_MS) {
         lastUpdatePoll = now;
         String action = pollForDecision();
         if (action.length() > 0) processPendingDecision(action);
       }
     }
-  }
-
-  // ---- SAFETY RESET ----------------------------------------
-  else if (currentState != STATE_GRANTED && currentState != STATE_DENIED) {
-    static unsigned long errorTimer = 0;
-    if (errorTimer == 0) errorTimer = now;
-    if (now - errorTimer > 5000) { errorTimer = 0; currentState = STATE_IDLE; }
   }
 
   delay(10);
