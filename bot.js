@@ -1,6 +1,5 @@
 // ============================================================
 //  index.js — Bot entry point, Discord client, event routing
-//  File 1/4  |  RFID Access Control Bot
 // ============================================================
 'use strict';
 
@@ -54,18 +53,14 @@ client.once(Events.ClientReady, async () => {
 
   console.log(`[BOT] Logging to channel: #${channel.name}`);
 
-  // Wire up API module with client + channel
   setClient(client, channel);
 
-  // Register slash commands
   await registerCommands(client);
 
-  // Yearly CSV reminder
   if (storage.shouldRemindYearlyUpdate()) {
     channel.send('📅 **Yearly Reminder:** Please review and update the member database for the new year!').catch(() => {});
   }
 
-  // Boot message
   channel.send({
     embeds: [{
       color: 0x2ECC71,
@@ -79,17 +74,14 @@ client.once(Events.ClientReady, async () => {
 // ─── INTERACTION HANDLER ─────────────────────────────────────
 client.on(Events.InteractionCreate, async interaction => {
 
-  // Slash commands
   if (interaction.isChatInputCommand()) {
     return handleCommand(interaction);
   }
 
-  // Button clicks (pending request decisions)
   if (interaction.isButton()) {
     return handleButtonDecision(interaction);
   }
 
-  // Modal submit (add_member flow)
   if (interaction.isModalSubmit()) {
     if (interaction.customId.startsWith('modal_add::')) {
       return handleModalSubmit(interaction);
@@ -106,17 +98,14 @@ process.on('unhandledRejection', (reason) => {
 
 process.on('uncaughtException', (e) => {
   console.error('[EXCEPTION]', e.message);
-  // Do NOT exit — keep the bot alive
 });
 
 // ─── EXPRESS API SERVER ──────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// Mount ESP32 API routes under /api
 app.use('/api', apiRouter);
 
-// Health check (no auth required)
 app.get('/health', (_req, res) => res.json({
   ok:      true,
   uptime:  process.uptime(),
@@ -124,10 +113,8 @@ app.get('/health', (_req, res) => res.json({
   time:    new Date().toISOString(),
 }));
 
-// 404 handler
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
-// Error handler
 app.use((err, _req, res, _next) => {
   console.error('[HTTP]', err.message);
   res.status(500).json({ error: 'Internal server error' });
