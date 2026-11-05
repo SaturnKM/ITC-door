@@ -17,17 +17,19 @@ An offline-first, production-ready door access system using an **ESP32-C3 Super 
 * **Concurrent Scanning:** Multi-user request queuing ensures simultaneous scans do not overwrite or block one another.
 * **Local Storage & Backup:** Automatic multi-tier CSV back-ups across both the host server and local ESP32 filesystem (`LittleFS`).
 * **Time-Based Access Control:** Built-in configurable time-window rules (disabled by default for flexible club schedules).
+* **No Tunnels Required:** The bot runs on a dedicated server hosted by **Robo**, so no ngrok, DuckDNS, or other tunneling/dynamic DNS service is needed.
+* **🔮 Coming Soon:** Team-based access with scheduled sessions (Robotics, Web, ...) and name-first Discord notifications. See [Roadmap](#-roadmap-upcoming-updates).
 
 ---
 
 ## 🏗️ Architecture Overview
 
 ```
-┌─────────────┐     WiFi/HTTP     ┌──────────────┐    WebSocket   ┌───────────────┐
-│  ESP32-C3   │  ───────────────▶ │  Node.js bot │ ─────────────▶ │    Discord    │
-│  + RDM6300  │ ◀───────────────  │  (Express)   │ ◀───────────── │    (admin)    │
-│  + LCD/LED  │   poll for answer │              │   button click │               │
-└─────────────┘                   └──────────────┘                └───────────────┘
+┌─────────────┐     WiFi/HTTP     ┌──────────────────┐    WebSocket   ┌───────────────┐
+│  ESP32-C3   │  ───────────────▶ │  Node.js bot     │ ─────────────▶ │    Discord    │
+│  + RDM6300  │ ◀───────────────  │  (Express)       │ ◀───────────── │    (admin)    │
+│  + LCD/LED  │   poll for answer │  hosted by Robo  │   button click │               │
+└─────────────┘                   └──────────────────┘                └───────────────┘
         │
         └──▶ Relay ──▶ Door lock
 ```
@@ -38,10 +40,29 @@ An offline-first, production-ready door access system using an **ESP32-C3 Super 
 | :--- | :--- | :---: | :---: |
 | **`President`** | Always | ❌ No | ❌ No |
 | **`ExclusiveBoard`**| Always | ❌ No | ❌ No |
-| **`Leader`** | Pending or Day-Grant | ⚠️ For Escalation | 🔑 Yes |
-| **`Member`** | Pending or Day-Grant | ⚠️ For Escalation | 🔑 Yes |
+| **`Leader`** | Pending or Day-Grant *(+ team sessions, planned)* | ⚠️ For Escalation | 🔑 Yes |
+| **`Member`** | Pending or Day-Grant *(+ team sessions, planned)* | ⚠️ For Escalation | 🔑 Yes |
 | **`Pending`** | Never | — | ❌ No |
 | **`Banned`** | Never | — | ❌ No |
+
+---
+
+## 🖥️ Hosting (Robo's Server)
+
+The bot server is hosted by **Robo**, a friend of the club. This replaces any previous tunnel or dynamic-DNS setup (ngrok, DuckDNS, etc.).
+
+* The bot (`npm start`) runs permanently on Robo's machine/server, ideally under a process manager such as **pm2** or **systemd** so it restarts automatically after a reboot or crash.
+* Robo exposes port `3000` (or places the bot behind a reverse proxy) and gives the club a stable **address** (domain or static IP). The ESP32 firmware points at that address.
+* Only Robo needs to maintain the host. The club only has to keep the ESP32 firmware's `SERVER_URL` and `API_KEY` in sync with what Robo runs.
+* Robo should keep the `.env` file private and back up the `data/` folder regularly.
+
+### Hand-off checklist for Robo
+
+1. Install **Node.js v18+**.
+2. Copy the `bot/` folder and create the `.env` file (see below).
+3. Run `npm install`, then start with `pm2 start bot.js --name door-bot` (or `npm start`).
+4. Open/forward port `3000` (or set up a reverse proxy with HTTPS).
+5. Send the club the final address so it can be put in the firmware.
 
 ---
 
@@ -58,7 +79,8 @@ bot/
 │   ├── members.csv
 │   ├── members_bak.csv
 │   ├── logs.csv
-│   └── update_queue.json
+│   ├── update_queue.json
+│   └── sessions.csv        # (planned) team session schedule
 └── README.md       # Project documentation
 ```
 
@@ -69,7 +91,7 @@ bot/
 * **Node.js** `v18.0.0` or higher
 * A registered **Discord Bot Application** with `bot` and `applications.commands` scopes
 * Discord Bot permissions: `Send Messages`, `Embed Links`, `Read Message History`
-* Host PC on the local network (or accessible remotely via dynamic DNS, e.g., DuckDNS)
+* A host reachable by the ESP32: **Robo's server** (stable domain or static IP, port `3000` open)
 * Arduino IDE (or PlatformIO) configured for ESP32 target boards
 
 ---
@@ -87,7 +109,7 @@ bot/
 
 ### Environment Configuration (`.env`)
 
-Create a `.env` file in the `bot/` directory with the following contents:
+Create a `.env` file in the `bot/` directory (on Robo's server) with the following contents:
 
 ```env
 BOT_TOKEN=your_bot_token_here
@@ -97,7 +119,7 @@ API_KEY=pick_a_long_random_string
 PORT=3000
 ```
 
-> 🔐 **Important:** The `API_KEY` defined here must match the key hardcoded into your ESP32 microcontroller firmware.
+> 🔐 **Important:** The `API_KEY` defined here must match the key hardcoded into your ESP32 microcontroller firmware. Share it with Robo privately, never in a public channel.
 
 ---
 
@@ -107,6 +129,15 @@ PORT=3000
 cd bot
 npm install
 npm start
+```
+
+For permanent hosting (recommended for Robo):
+
+```bash
+npm install -g pm2
+pm2 start bot.js --name door-bot
+pm2 save
+pm2 startup
 ```
 
 Upon successful startup, the console will output the following operational logs:
@@ -160,13 +191,13 @@ Upon successful startup, the console will output the following operational logs:
 #define WIFI_SSID           "YOUR_2.4GHZ_SSID"
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
 
-#define SERVER_URL          "ITCDOOR.duckdns.org"  // Or local LAN IP
+#define SERVER_URL          "ROBO_SERVER_ADDRESS"  // Domain or IP given by Robo
 #define SERVER_PORT         3000
-#define USE_HTTPS           false                  // Plain HTTP for local/DuckDNS setups
+#define USE_HTTPS           false                  // Set true if Robo puts the bot behind HTTPS
 
 #define API_KEY             "must_match_.env_exactly"
 #define TIMEZONE_STR        "CET-1CEST,M3.5.0,M10.5.0/3"
-#define DISABLE_TIME_RULES  true
+#define DISABLE_TIME_RULES  true                   // Must be false once team sessions are enabled
 ```
 
 > 📶 **Network Note:** ESP32-C3 modules operate strictly on **2.4 GHz** Wi-Fi networks.
@@ -194,6 +225,17 @@ Upon successful startup, the console will output the following operational logs:
 | `/sync` | Re-pushes member databases to the controller |
 | `/help` | Returns full command reference |
 
+### 🔮 Planned commands (team access)
+
+| Command | Action |
+| :--- | :--- |
+| `/team_add <uid> <team>` | Adds a member to a team (e.g. `robotics`, `web`) |
+| `/team_remove <uid> <team>` | Removes a member from a team |
+| `/team_list [team]` | Lists members of a team |
+| `/session_add <team> <day> <start> <end>` | Creates a recurring weekly session |
+| `/session_remove <id>` | Deletes a session |
+| `/session_list [team]` | Shows the session schedule |
+
 ---
 
 ## 🔄 Unknown Card Workflow
@@ -212,19 +254,82 @@ When an unassigned card (or member without day-access) is scanned:
 
 ---
 
+## 🗺️ Roadmap (Upcoming Updates)
+
+### 1. Discord notifications: make the visitor's name stand out
+
+The access-request notification will be reworked so admins can instantly see **who** is at the door.
+
+* **Name first:** If the scanned card already belongs to a registered member, their **name becomes the headline** of the notification (e.g. `👤 Sara Benali wants to enter the club`) instead of being buried in the details.
+* **UID secondary:** The card UID, role, and request ID move into smaller detail fields below the name.
+* **Unknown cards:** If the card has no name yet, the notification shows `❓ Unknown card` with the UID highlighted, plus the **➕ Add Member** button so it can be named right away.
+* **Role and team badges:** The member's role (`Member`, `Leader`, `Pending`, `Banned`) and teams are shown next to the name so admins can decide faster.
+* **Same buttons:** Grant 1 Day, Access Once, Add Member, Deny, and Ban stay unchanged.
+* **Logs:** Entries in the log channel and `/log` will also show the name before the UID.
+
+### 2. Team-based access with scheduled sessions (formations)
+
+Members can open the door **without admin approval**, but only for their own team's scheduled sessions. For example, Robotics members during a Robotics session, Web developers during a Web session.
+
+**Teams**
+* A new `teams` column in `members.csv` (e.g. `robotics`, `web`, or `robotics|web`).
+* Managed with `/team_add`, `/team_remove`, `/team_list`.
+
+**Sessions**
+* A new `data/sessions.csv` with the columns `team, day, start, end`:
+
+  | team | day | start | end |
+  | :--- | :--- | :--- | :--- |
+  | robotics | Saturday | 14:00 | 17:00 |
+  | web | Sunday | 10:00 | 13:00 |
+
+* Managed with `/session_add`, `/session_remove`, `/session_list`.
+
+**Access rule**
+
+A card opens the door without admin approval only if all of these are true:
+
+1. The member's role is accepted (`Member` or `Leader`, not `Pending` or `Banned`).
+2. The member belongs to a team that has a session running right now.
+3. The current time is inside that session's window.
+
+Otherwise the normal Discord approval flow applies. `President` and `ExclusiveBoard` keep unrestricted access.
+
+**Offline behavior**
+* The ESP32 stores `/sessions.csv` in LittleFS next to `/members.csv`, so team access keeps working when the server is down.
+* Requires `DISABLE_TIME_RULES false` and an NTP-synced clock.
+* `/sync` pushes both `members.csv` and `sessions.csv` to the controller.
+
+**Notifications for denied scans**
+
+When a scan is not covered by a session (wrong team or outside hours), the Discord card shows the member's name, role, teams, and the reason, e.g. "Web member scanned during a Robotics session". Admins can still grant one day or access once.
+
+**Open questions**
+* Should the door open early or stay open late around a session (e.g. 15 minutes before and after)?
+* Can Leaders open for their own team outside session hours?
+* Are one-off sessions on a specific date needed, or only weekly recurring ones?
+
+### 3. Hosting
+
+* Moving from DuckDNS to **Robo's dedicated server**. No tunneling or dynamic DNS service is used anymore.
+
+---
+
 ## 💾 Storage Architecture
 
 Data is stored redundantly across local storage mediums:
 
 | Target File | Device Location | Role |
 | :--- | :--- | :--- |
-| `data/members.csv` | Host Server PC | Primary database |
-| `data/members_bak.csv` | Host Server PC | Automatic fallback backup |
-| `data/logs.csv` | Host Server PC | Entry/exit activity audit log |
-| `data/update_queue.json` | Host Server PC | Offline synchronization queue |
+| `data/members.csv` | Robo's server | Primary database |
+| `data/members_bak.csv` | Robo's server | Automatic fallback backup |
+| `data/logs.csv` | Robo's server | Entry/exit activity audit log |
+| `data/update_queue.json` | Robo's server | Offline synchronization queue |
+| `data/sessions.csv` *(planned)* | Robo's server | Team session schedule |
 | `/members.csv` | ESP32 `LittleFS` | Offline hardware access database |
 | `/members_bak.csv` | ESP32 `LittleFS` | ESP hardware backup |
 | `/logs.csv` | ESP32 `LittleFS` | Offline denial logs |
+| `/sessions.csv` *(planned)* | ESP32 `LittleFS` | Offline session schedule |
 
 ---
 
@@ -234,8 +339,9 @@ Data is stored redundantly across local storage mediums:
 * Request IDs prevent replay attacks and race condition overrides.
 * CSV writes use atomic file replacement routines to avoid data corruption.
 * Input fields are sanitized against character injection attacks.
+* Only Robo and the club admins should have access to the `.env` file and `data/` folder.
 
-> 🚨 **HTTPS Warning:** For public internet deployments, place a reverse proxy (such as Caddy or Nginx with Let's Encrypt TLS) in front of the Express server.
+> 🚨 **HTTPS Warning:** Since the bot is reachable over the internet from Robo's server, place a reverse proxy (such as Caddy or Nginx with Let's Encrypt TLS) in front of the Express server and set `USE_HTTPS true` in the firmware.
 
 ---
 
