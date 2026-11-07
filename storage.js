@@ -1,6 +1,6 @@
 // ============================================================
 //  storage.js — Member database & log management
-//  File 4/4  |  RFID Access Control Bot  |  v3.1
+//  RFID Access Control Bot  |  v3.2
 // ============================================================
 'use strict';
 
@@ -18,30 +18,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ─── DEFAULT MEMBERS ─────────────────────────────────────────
 const DEFAULTS = [
-  { name: "Islem",        uid: "0002787912", role: "Member" },
-  { name: "Djilali",      uid: "0007680714", role: "Member" },
-  { name: "Ibtissem",     uid: "0006505824", role: "Member" },
-  { name: "Feriel",       uid: "0009860301", role: "Member" },
-  { name: "Ismail",       uid: "0007875382", role: "Member" },
-  { name: "Khadidja",     uid: "0003752638", role: "Member" },
-  { name: "abdelmadjid",  uid: "0010619675", role: "Member" },
-  { name: "Abdellah",     uid: "0006579751", role: "Member" },
-  { name: "Mahdi",        uid: "0008321581", role: "Member" },
-  { name: "Anis",         uid: "0007869479", role: "Member" },
-  { name: "maroua",       uid: "0009686941", role: "Member" },
-  { name: "djamel",       uid: "0014351112", role: "Member" },
-  { name: "Abd Erraouf",  uid: "0004022966", role: "Member" },
-  { name: "amira",        uid: "0006819271", role: "Member" },
-  { name: "Lafdal",       uid: "0002672952", role: "Member" },
-  { name: "IKHLAS",       uid: "0014755425", role: "Member" },
-  { name: "YAZI",         uid: "0006527607", role: "Member" },
-  { name: "Ziouani",      uid: "0014692887", role: "Member" },
-  { name: "Dhaia",        uid: "0009660230", role: "Member" },
-  { name: "adem",         uid: "0006557881", role: "Member" },
-  { name: "Ibrahim",      uid: "0010940033", role: "President" },
-  { name: "Nour",         uid: "0014883107", role: "Member" },
-  { name: "dounia",       uid: "0006587684", role: "Member" },
-  { name: "amani",        uid: "0009962268", role: "Member" },
+  { name: "tester",      uid: "0000000000", role: "President" },
 ];
 
 // ─── UID NORMALIZE ───────────────────────────────────────────
@@ -284,12 +261,14 @@ function flushQueue() {
 function peekQueue() { return [...updateQueue]; }
 
 // ─── LOG SYSTEM ──────────────────────────────────────────────
+// Columns: timestamp,uid,name,role,event,reason,esp_time,decided_by
+// (old rows without decided_by still read fine)
 function appendLog(entry) {
   try {
     if (!fs.existsSync(LOGS_FILE)) {
-      fs.writeFileSync(LOGS_FILE, 'timestamp,uid,name,role,event,reason,esp_time\n', 'utf8');
+      fs.writeFileSync(LOGS_FILE, 'timestamp,uid,name,role,event,reason,esp_time,decided_by\n', 'utf8');
     }
-    const line = `${Date.now()},${csvField(entry.uid)},${csvField(entry.name)},${csvField(entry.role)},${csvField(entry.event)},${csvField(entry.reason)},${csvField(entry.time)}\n`;
+    const line = `${Date.now()},${csvField(entry.uid)},${csvField(entry.name)},${csvField(entry.role)},${csvField(entry.event)},${csvField(entry.reason)},${csvField(entry.time)},${csvField(entry.decidedBy)}\n`;
     fs.appendFileSync(LOGS_FILE, line, 'utf8');
   } catch (e) { console.error('[LOG] Write error:', e.message); }
 }
@@ -300,8 +279,8 @@ function getRecentLogs(n = 50) {
     const lines = fs.readFileSync(LOGS_FILE, 'utf8').trim().split('\n').filter(Boolean);
     const dataLines = lines[0]?.startsWith('timestamp,') ? lines.slice(1) : lines;
     return dataLines.slice(-n).reverse().map(l => {
-      const [ts, uid, name, role, event, reason, time] = l.split(',');
-      return { ts: parseInt(ts), uid, name, role, event, reason, time };
+      const [ts, uid, name, role, event, reason, time, decidedBy] = l.split(',');
+      return { ts: parseInt(ts), uid, name, role, event, reason, time, decidedBy };
     });
   } catch { return []; }
 }
