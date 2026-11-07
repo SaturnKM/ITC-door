@@ -14,11 +14,14 @@ An offline-first, production-ready door access system using an **ESP32-C3 Super 
 
 * **Offline-First Access:** Presidents and Exclusive Board members can unlock doors instantly without an internet or local network connection.
 * **Discord Integration:** Approve, deny, or manage door access requests using Discord slash commands and interactive buttons from anywhere.
+* **Name-First Notifications:** The request card shows *who* is at the door (name, role, "Registered" / "Not registered") so admins can decide at a glance.
+* **Decision Audit Trail:** Every accept/deny shows **who decided and when**, on the card, in the log channel, and in `/log`.
+* **Easy Member Adding:** Add people through a pop-up form (no hard-coded command format), right after a decision or with `/addmember`.
 * **Concurrent Scanning:** Multi-user request queuing ensures simultaneous scans do not overwrite or block one another.
 * **Local Storage & Backup:** Automatic multi-tier CSV back-ups across both the host server and local ESP32 filesystem (`LittleFS`).
 * **Time-Based Access Control:** Built-in configurable time-window rules (disabled by default for flexible club schedules).
 * **No Tunnels Required:** The bot runs on a dedicated server hosted by **Robo**, so no ngrok, DuckDNS, or other tunneling/dynamic DNS service is needed.
-* **🔮 Coming Soon:** Team-based access with scheduled sessions (Robotics, Web, ...) and name-first Discord notifications. See [Roadmap](#-roadmap-upcoming-updates).
+* **🔮 Coming Soon:** Team-based access with scheduled sessions (Robotics, Web, ...). See [Roadmap](#-roadmap-upcoming-updates).
 
 ---
 
@@ -71,8 +74,8 @@ The bot server is hosted by **Robo**, a friend of the club. This replaces any pr
 ```
 bot/
 ├── bot.js          # Entry point — Discord client + Express server
-├── commands.js     # Discord slash commands execution (16 commands)
-├── api.js          # REST API endpoints for the ESP32 controller
+├── commands.js     # Discord slash commands execution (17 commands)
+├── api.js          # REST API for the ESP32 + request cards, buttons & forms
 ├── storage.js      # Member CSV database, logging, & sync queue logic
 ├── .env            # Private configuration environment variables
 ├── data/           # Runtime persistent state (auto-created)
@@ -81,6 +84,7 @@ bot/
 │   ├── logs.csv
 │   ├── update_queue.json
 │   └── sessions.csv        # (planned) team session schedule
+├── LICENSE         # Unlicense (public domain)
 └── README.md       # Project documentation
 ```
 
@@ -112,7 +116,7 @@ bot/
 Create a `.env` file in the `bot/` directory (on Robo's server) with the following contents:
 
 ```env
-BOT_TOKEN=your_bot_token_here
+DISCORD_TOKEN=your_bot_token_here
 CHANNEL_ID=your_log_channel_id
 GUILD_ID=your_server_id
 API_KEY=pick_a_long_random_string
@@ -147,7 +151,7 @@ Upon successful startup, the console will output the following operational logs:
 [HTTP] API server listening on port 3000
 [BOT] Logged in as YourBot#1234
 [BOT] Logging to channel: #door-logs
-[CMD] Registered 16 commands to guild 123456789
+[CMD] Registered 17 commands to guild 123456789
 ```
 
 ---
@@ -208,7 +212,8 @@ Upon successful startup, the console will output the following operational logs:
 
 | Command | Action |
 | :--- | :--- |
-| `/add <name> <uid> [role]` | Registers a new access card |
+| `/addmember` | Opens a pop-up form to register a member (name, card UID, role) |
+| `/add <name> <uid> [role]` | Registers a new access card (one-line version) |
 | `/ban <uid>` | Revokes access permanently |
 | `/unban <uid> [role]` | Restores access permissions |
 | `/grant_day <uid>` | Authorizes access until midnight |
@@ -219,11 +224,13 @@ Upon successful startup, the console will output the following operational logs:
 | `/rename <uid> <name>` | Updates cardholder description |
 | `/list [role]` | Displays registered members by category |
 | `/pending` | Shows active authorization requests |
-| `/log [n]` | Returns real-time entry logs |
+| `/log [n]` | Returns recent entry logs, including who approved each one |
 | `/report` | Summarizes access stats |
 | `/status` | Returns system diagnostics |
 | `/sync` | Re-pushes member databases to the controller |
 | `/help` | Returns full command reference |
+
+In the `/addmember` form, the role is plain text and not case-sensitive: `member`, `leader`, `board` (or `exclusive board`), `president`. Leave it empty for `Member`.
 
 ### 🔮 Planned commands (team access)
 
@@ -238,36 +245,29 @@ Upon successful startup, the console will output the following operational logs:
 
 ---
 
-## 🔄 Unknown Card Workflow
+## 🔄 Access Request Workflow
 
-When an unassigned card (or member without day-access) is scanned:
+When a card that needs approval is scanned (unregistered card, or a member without a day pass):
 
 1. ESP32 sends a payload to `POST /api/scan` containing `uid` + `request_id`.
-2. Bot renders a Discord notification card with action options:
-   * **✅ Grant 1 Day** — Authorizes access until midnight.
-   * **🔓 Access Once** — Single entry authorization (60s timer).
-   * **➕ Add Member** — Displays registration modal.
-   * **❌ Deny** — Denies access request.
-   * **🔨 Ban** — Blacklists card UID.
-3. ESP32 polls `GET /api/pending/:request_id` every 3 seconds.
-4. Requests automatically expire after 60 seconds if no action is taken.
+2. The bot posts a Discord card with the **name as the headline** and a clear status:
+   * **Registered member:** `🔔 Sara wants to enter`, with role and a "✅ Registered member" line.
+     Buttons: **🔓 Let In Once**, **📅 Grant 1 Day** (Leader/Member only), **❌ Deny**, **🔨 Ban**.
+   * **Unknown card:** `🔔 Unknown card wants to enter`, with a "⚠️ Not registered" line.
+     Buttons: **🔓 Let In**, **❌ Deny**, **🔨 Ban**.
+   * **Banned member:** `🔴 Name — BANNED member at the door`.
+     Buttons: **Unban & Open Door**, **Unban Only**, **Ignore**.
+3. When an admin clicks, the card is updated in place: it turns green (accepted), red (denied) or dark red (banned), the buttons are removed, and it shows **who decided and when**.
+4. For an **unknown card that was let in or denied**, the card keeps one **➕ Add as Member** button. It opens a form (name, optional role) and registers the card without changing the decision.
+5. ESP32 polls `GET /api/pending/:request_id` every 3 seconds.
+6. Requests expire after 60 seconds if nobody answers. An expired card for an unregistered person keeps an **➕ Add Member** button, so they can still be registered (the door is not opened, they scan again).
+7. The log-channel message for the entry also shows who approved or denied it, and `/log` stores it in the `decided_by` column of `logs.csv`.
 
 ---
 
 ## 🗺️ Roadmap (Upcoming Updates)
 
-### 1. Discord notifications: make the visitor's name stand out
-
-The access-request notification will be reworked so admins can instantly see **who** is at the door.
-
-* **Name first:** If the scanned card already belongs to a registered member, their **name becomes the headline** of the notification (e.g. `👤 Sara Benali wants to enter the club`) instead of being buried in the details.
-* **UID secondary:** The card UID, role, and request ID move into smaller detail fields below the name.
-* **Unknown cards:** If the card has no name yet, the notification shows `❓ Unknown card` with the UID highlighted, plus the **➕ Add Member** button so it can be named right away.
-* **Role and team badges:** The member's role (`Member`, `Leader`, `Pending`, `Banned`) and teams are shown next to the name so admins can decide faster.
-* **Same buttons:** Grant 1 Day, Access Once, Add Member, Deny, and Ban stay unchanged.
-* **Logs:** Entries in the log channel and `/log` will also show the name before the UID.
-
-### 2. Team-based access with scheduled sessions (formations)
+### 1. Team-based access with scheduled sessions (formations)
 
 Members can open the door **without admin approval**, but only for their own team's scheduled sessions. For example, Robotics members during a Robotics session, Web developers during a Web session.
 
@@ -302,14 +302,14 @@ Otherwise the normal Discord approval flow applies. `President` and `ExclusiveBo
 
 **Notifications for denied scans**
 
-When a scan is not covered by a session (wrong team or outside hours), the Discord card shows the member's name, role, teams, and the reason, e.g. "Web member scanned during a Robotics session". Admins can still grant one day or access once.
+When a scan is not covered by a session (wrong team or outside hours), the Discord card shows the member's name, role, teams, and the reason, e.g. "Web member scanned during a Robotics session". Admins can still grant one day or access once. Team badges will also be added next to the name on request cards.
 
 **Open questions**
 * Should the door open early or stay open late around a session (e.g. 15 minutes before and after)?
 * Can Leaders open for their own team outside session hours?
 * Are one-off sessions on a specific date needed, or only weekly recurring ones?
 
-### 3. Hosting
+### 2. Hosting
 
 * Moving from DuckDNS to **Robo's dedicated server**. No tunneling or dynamic DNS service is used anymore.
 
@@ -323,7 +323,7 @@ Data is stored redundantly across local storage mediums:
 | :--- | :--- | :--- |
 | `data/members.csv` | Robo's server | Primary database |
 | `data/members_bak.csv` | Robo's server | Automatic fallback backup |
-| `data/logs.csv` | Robo's server | Entry/exit activity audit log |
+| `data/logs.csv` | Robo's server | Entry/exit activity audit log (includes who approved) |
 | `data/update_queue.json` | Robo's server | Offline synchronization queue |
 | `data/sessions.csv` *(planned)* | Robo's server | Team session schedule |
 | `/members.csv` | ESP32 `LittleFS` | Offline hardware access database |
