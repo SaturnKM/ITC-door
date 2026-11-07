@@ -63,6 +63,10 @@ async function respond(interaction, payload) {
 const commandDefs = [
 
   new SlashCommandBuilder()
+    .setName('addmember')
+    .setDescription('Add a new member using a simple form (name, card UID, role)'),
+
+  new SlashCommandBuilder()
     .setName('add')
     .setDescription('Add a new member')
     .addStringOption(o => o.setName('name').setDescription('Full name').setRequired(true))
@@ -172,6 +176,12 @@ async function handleCommand(interaction) {
   try {
     switch (commandName) {
 
+      case 'addmember': {
+        // Opens a pop-up form — must be the first response to the interaction
+        await interaction.showModal(api.buildAddModal('modal_new', null));
+        break;
+      }
+
       case 'add': {
         const name    = interaction.options.getString('name');
         const uid     = interaction.options.getString('uid').trim();
@@ -251,8 +261,7 @@ async function handleCommand(interaction) {
       case 'open_door': {
         api.queueDoorCommand('open_door');
         await respond(interaction, {
-          content: '🔓 Door open command sent — ESP will open within **8 seconds**.',
-          flags: MessageFlags.Ephemeral,
+          content: `🔓 Door open command sent by **${interaction.member?.displayName || interaction.user.username}** — ESP will open within **8 seconds**.`,
         });
         break;
       }
@@ -347,7 +356,7 @@ async function handleCommand(interaction) {
             { name: 'Name',   value: member?.name || '_Unknown_',                            inline: true },
             { name: 'Req ID', value: `\`${p.request_id}\``,                                 inline: true },
             { name: 'Age',    value: `${age}s / 60s`,                                       inline: true },
-            { name: 'Status', value: p.decision ? `✅ ${p.decision.action}` : '⏳ Waiting', inline: true },
+            { name: 'Status', value: p.decision ? `✅ ${p.decision.action}${p.decision.by ? ` (by ${p.decision.by})` : ''}` : '⏳ Waiting', inline: true },
           );
         await respond(interaction, { embeds: [embed], flags: MessageFlags.Ephemeral });
         break;
@@ -368,7 +377,9 @@ async function handleCommand(interaction) {
           const reason  = l.reason && l.reason.trim() && !['undefined','N/A',''].includes(l.reason.trim())
             ? ` — _${l.reason.trim()}_` : '';
           const display = l.name && !['undefined','N/A',''].includes(l.name) ? l.name : l.uid;
-          return `${icon} **${display}** _(${l.role || '?'})_${espTime}${reason} · ${serverDate}`;
+          const by      = l.decidedBy && l.decidedBy.trim()
+            ? ` · ${l.event === 'granted' ? 'approved' : 'decided'} by **${l.decidedBy.trim()}**` : '';
+          return `${icon} **${display}** _(${l.role || '?'})_${espTime}${reason}${by} · ${serverDate}`;
         });
         const embed = new EmbedBuilder()
           .setColor(0x34495E)
@@ -449,7 +460,8 @@ async function handleCommand(interaction) {
           .setColor(0x3498DB)
           .setTitle('📖 RFID Access Control — Commands')
           .setDescription([
-            '`/add <n> <uid> [role]` — Add a new member',
+            '`/addmember` — Add a member with a simple pop-up form',
+            '`/add <n> <uid> [role]` — Add a new member (one-line version)',
             '`/ban <uid>` — Permanently ban a member',
             '`/unban <uid> [role]` — Unban and restore role (default: Member)',
             '`/grant_day <uid>` — Grant today-only access (Leader/Member)',
@@ -460,7 +472,7 @@ async function handleCommand(interaction) {
             '`/rename <uid> <n>` — Rename a member',
             '`/list [role]` — List members grouped by role',
             '`/pending` — Show active pending request',
-            '`/log [n]` — Show recent access logs',
+            '`/log [n]` — Show recent access logs (with who approved)',
             '`/report` — Full access report',
             '`/status` — System status',
             '`/sync` — Force re-push all members to ESP32',
