@@ -17,7 +17,7 @@ const { handleCommand, registerCommands } = require('./commands');
 const storage    = require('./storage');
 
 // ─── VALIDATE ENV ────────────────────────────────────────────
-const REQUIRED_ENV = ['BOT_TOKEN', 'CHANNEL_ID', 'API_KEY', 'PORT'];
+const REQUIRED_ENV = ['DISCORD_TOKEN', 'CHANNEL_ID', 'API_KEY', 'PORT'];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
     console.error(`[BOOT] Missing env variable: ${key}`);
@@ -73,19 +73,30 @@ client.once(Events.ClientReady, async () => {
 
 // ─── INTERACTION HANDLER ─────────────────────────────────────
 client.on(Events.InteractionCreate, async interaction => {
-
-  if (interaction.isChatInputCommand()) {
-    return handleCommand(interaction);
-  }
-
-  if (interaction.isButton()) {
-    return handleButtonDecision(interaction);
-  }
-
-  if (interaction.isModalSubmit()) {
-    if (interaction.customId.startsWith('modal_add::')) {
-      return handleModalSubmit(interaction);
+  try {
+    if (interaction.isChatInputCommand()) {
+      return await handleCommand(interaction);
     }
+
+    if (interaction.isButton()) {
+      return await handleButtonDecision(interaction);
+    }
+
+    if (interaction.isModalSubmit()) {
+      // modal_add::<request>::<uid>  (from a scan card)
+      // modal_new                    (from /addmember)
+      if (interaction.customId.startsWith('modal_add') || interaction.customId.startsWith('modal_new')) {
+        return await handleModalSubmit(interaction);
+      }
+    }
+  } catch (e) {
+    console.error('[INTERACTION] Unhandled error:', e);
+    if (e.code === 10062 || e.code === 40060) return;
+    try {
+      const payload = { content: '❌ Something went wrong. Please try again.', ephemeral: true };
+      if (interaction.replied || interaction.deferred) await interaction.followUp(payload);
+      else await interaction.reply(payload);
+    } catch {}
   }
 });
 
@@ -126,7 +137,7 @@ app.listen(PORT, () => {
 });
 
 // ─── LOGIN ───────────────────────────────────────────────────
-client.login(process.env.BOT_TOKEN).catch(e => {
+client.login(process.env.DISCORD_TOKEN).catch(e => {
   console.error('[BOT] Login failed:', e.message);
   process.exit(1);
 });
